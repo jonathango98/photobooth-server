@@ -40,9 +40,8 @@ const eventSchema = new mongoose.Schema({
   updated_at: { type: Date, default: Date.now },
 });
 
-eventSchema.pre("save", function (next) {
+eventSchema.pre("save", async function () {
   this.updated_at = new Date();
-  next();
 });
 
 export default mongoose.model("Event", eventSchema);
