@@ -39,8 +39,29 @@ const __dirname = path.dirname(__filename);
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// Serve frontend files (index.html, main.js, etc.)
 app.use(express.static(path.join(__dirname, "public")));
+
+app.use((req, res, next) => {
+  res.header("Access-Control-Allow-Origin", "*");
+  res.header("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
+  res.header("Access-Control-Allow-Headers", "Content-Type, x-admin-password");
+  if (req.method === "OPTIONS") return res.sendStatus(200);
+  next();
+});
+
+app.use(express.json());
+
+// --------------------------
+// Admin auth middleware
+// --------------------------
+const checkAdmin = (req, res, next) => {
+  const password = req.headers["x-admin-password"];
+  if (password === process.env.ADMIN_PASSWORD) {
+    next();
+  } else {
+    res.status(401).json({ error: "Unauthorized" });
+  }
+};
 
 // --------------------------
 // /health endpoint (health check)
@@ -93,33 +114,30 @@ async function presignedUrl(key) {
 // --------------------------
 // /api/save endpoint
 // --------------------------
+const MAX_RAW_PHOTOS = 10;
 const cpUpload = upload.fields([
-  { name: "raw1", maxCount: 1 },
-  { name: "raw2", maxCount: 1 },
-  { name: "raw3", maxCount: 1 },
+  ...Array.from({ length: MAX_RAW_PHOTOS }, (_, i) => ({ name: `raw${i + 1}`, maxCount: 1 })),
   { name: "collage", maxCount: 1 },
 ]);
 
 app.post("/api/save", cpUpload, async (req, res) => {
   try {
     const files = req.files || {};
-    console.log("Received files:", Object.keys(files));
 
     const sessionId = Date.now().toString();
 
     // 1) Upload raw photos
-    const rawFields = ["raw1", "raw2", "raw3"];
     const uploadPromises = [];
 
-    rawFields.forEach((fieldName, index) => {
-      const fileArr = files[fieldName];
-      if (!fileArr || fileArr.length === 0) return;
+    for (let i = 0; i < MAX_RAW_PHOTOS; i++) {
+      const fileArr = files[`raw${i + 1}`];
+      if (!fileArr || fileArr.length === 0) continue;
 
       const file = fileArr[0];
       const ext = extFromMime(file.mimetype);
-      const key = `raw/session_${sessionId}_raw${index + 1}${ext}`;
+      const key = `raw/session_${sessionId}_raw${i + 1}${ext}`;
       uploadPromises.push(uploadToS3(file.buffer, key, file.mimetype));
-    });
+    }
 
     // 2) Upload collage
     const collageArr = files["collage"];
@@ -157,7 +175,7 @@ app.post("/api/save", cpUpload, async (req, res) => {
 // --------------------------
 // /api/admin/photos endpoint (list all photos)
 // --------------------------
-app.get("/api/admin/photos", async (_req, res) => {
+app.get("/api/admin/photos", checkAdmin, async (_req, res) => {
   try {
     const response = await s3.send(
       new ListObjectsV2Command({ Bucket: BUCKET_NAME, MaxKeys: 500 })
@@ -186,7 +204,7 @@ app.get("/api/admin/photos", async (_req, res) => {
 // --------------------------
 // /api/admin/download-zip endpoint (download all photos as zip)
 // --------------------------
-app.get("/api/admin/download-zip", async (_req, res) => {
+app.get("/api/admin/download-zip", checkAdmin, async (_req, res) => {
   try {
     const response = await s3.send(
       new ListObjectsV2Command({ Bucket: BUCKET_NAME, MaxKeys: 500 })
@@ -215,7 +233,7 @@ app.get("/api/admin/download-zip", async (_req, res) => {
 // --------------------------
 // /api/admin/download-selected endpoint (download selected photos)
 // --------------------------
-app.post("/api/admin/download-selected", express.json(), async (req, res) => {
+app.post("/api/admin/download-selected", checkAdmin, async (req, res) => {
   try {
     const { photoIds } = req.body;
 
