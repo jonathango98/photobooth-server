@@ -26,6 +26,7 @@ const s3 = new S3Client({
 });
 
 const BUCKET_NAME = process.env.BUCKET_NAME;
+const EVENT_ID = process.env.EVENT_ID || "default";
 
 // --------------------------
 // __dirname replacement in ESM
@@ -135,7 +136,7 @@ app.post("/api/save", cpUpload, async (req, res) => {
 
       const file = fileArr[0];
       const ext = extFromMime(file.mimetype);
-      const key = `raw/session_${sessionId}_raw${i + 1}${ext}`;
+      const key = `${EVENT_ID}/raw/session_${sessionId}_raw${i + 1}${ext}`;
       uploadPromises.push(uploadToS3(file.buffer, key, file.mimetype));
     }
 
@@ -148,7 +149,7 @@ app.post("/api/save", cpUpload, async (req, res) => {
 
     const collageFile = collageArr[0];
     const collageExt = extFromMime(collageFile.mimetype);
-    const collageKey = `collage/session_${sessionId}_collage${collageExt}`;
+    const collageKey = `${EVENT_ID}/collage/session_${sessionId}_collage${collageExt}`;
 
     await Promise.all([
       uploadToS3(collageFile.buffer, collageKey, collageFile.mimetype),
@@ -178,7 +179,7 @@ app.post("/api/save", cpUpload, async (req, res) => {
 app.get("/api/admin/photos", checkAdmin, async (_req, res) => {
   try {
     const response = await s3.send(
-      new ListObjectsV2Command({ Bucket: BUCKET_NAME, MaxKeys: 500 })
+      new ListObjectsV2Command({ Bucket: BUCKET_NAME, Prefix: `${EVENT_ID}/`, MaxKeys: 500 })
     );
 
     const photos = await Promise.all(
@@ -189,7 +190,7 @@ app.get("/api/admin/photos", checkAdmin, async (_req, res) => {
           id: obj.Key,
           url,
           uploadedAt: obj.LastModified,
-          folder: parts.length > 1 ? parts[0] : "root",
+          folder: parts.length > 2 ? parts[1] : "root",
         };
       })
     );
@@ -207,7 +208,7 @@ app.get("/api/admin/photos", checkAdmin, async (_req, res) => {
 app.get("/api/admin/download-zip", checkAdmin, async (_req, res) => {
   try {
     const response = await s3.send(
-      new ListObjectsV2Command({ Bucket: BUCKET_NAME, MaxKeys: 500 })
+      new ListObjectsV2Command({ Bucket: BUCKET_NAME, Prefix: `${EVENT_ID}/`, MaxKeys: 500 })
     );
 
     const archive = archiver("zip", { zlib: { level: 9 } });
