@@ -151,6 +151,46 @@ app.delete("/api/superadmin/events/:eventId", checkSuperAdmin, async (req, res) 
 });
 
 // --------------------------
+// /api/superadmin/tree endpoint (S3 folder tree per event)
+// --------------------------
+app.get("/api/superadmin/tree", checkSuperAdmin, async (_req, res) => {
+  try {
+    const [events, s3Response] = await Promise.all([
+      Event.find().sort({ created_at: -1 }),
+      s3.send(new ListObjectsV2Command({ Bucket: BUCKET_NAME, MaxKeys: 1000 })),
+    ]);
+
+    // Group S3 keys by event_id prefix
+    const folderMap = {};
+    for (const obj of s3Response.Contents || []) {
+      const parts = obj.Key.split("/");
+      if (parts.length < 2) continue;
+      const eventId = parts[0];
+      const folder = parts.length > 2 ? parts[1] : "root";
+      if (!folderMap[eventId]) folderMap[eventId] = {};
+      if (!folderMap[eventId][folder]) folderMap[eventId][folder] = 0;
+      folderMap[eventId][folder]++;
+    }
+
+    const tree = events.map((e) => ({
+      event_id: e.event_id,
+      event_name: e.event_name,
+      is_active: e.is_active,
+      created_at: e.created_at,
+      folders: Object.entries(folderMap[e.event_id] || {}).map(([name, count]) => ({
+        name,
+        count,
+      })),
+    }));
+
+    res.json({ ok: true, tree });
+  } catch (err) {
+    console.error("Error fetching tree:", err);
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
+// --------------------------
 // Multer setup (in-memory)
 // --------------------------
 const upload = multer({
