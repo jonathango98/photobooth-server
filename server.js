@@ -7,6 +7,8 @@ import {
   PutObjectCommand,
   ListObjectsV2Command,
   GetObjectCommand,
+  DeleteObjectCommand,
+  DeleteObjectsCommand,
 } from "@aws-sdk/client-s3";
 import { getSignedUrl } from "@aws-sdk/s3-request-presigner";
 import archiver from "archiver";
@@ -44,8 +46,8 @@ app.use(express.static(path.join(__dirname, "public")));
 
 app.use((req, res, next) => {
   res.header("Access-Control-Allow-Origin", "*");
-  res.header("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
-  res.header("Access-Control-Allow-Headers", "Content-Type, x-admin-password");
+  res.header("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS");
+  res.header("Access-Control-Allow-Headers", "Content-Type, x-admin-password, x-superadmin-password");
   if (req.method === "OPTIONS") return res.sendStatus(200);
   next();
 });
@@ -58,6 +60,18 @@ app.use(express.json());
 const checkAdmin = (req, res, next) => {
   const password = req.headers["x-admin-password"];
   if (password === process.env.ADMIN_PASSWORD) {
+    next();
+  } else {
+    res.status(401).json({ error: "Unauthorized" });
+  }
+};
+
+// --------------------------
+// Superadmin auth middleware
+// --------------------------
+const checkSuperadmin = (req, res, next) => {
+  const password = req.headers["x-superadmin-password"];
+  if (password && password === process.env.SUPERADMIN_PASSWORD) {
     next();
   } else {
     res.status(401).json({ error: "Unauthorized" });
@@ -269,6 +283,168 @@ app.post("/api/admin/download-selected", checkAdmin, async (req, res) => {
     await archive.finalize();
   } catch (err) {
     console.error("Error creating selected zip:", err);
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
+// --------------------------
+// Helper: build tree from S3 object list
+// --------------------------
+function buildTree(objects) {
+  const root = { name: "/", type: "folder", children: [] };
+
+  for (const obj of objects) {
+    const parts = obj.Key.split("/").filter(Boolean);
+    let node = root;
+
+    for (let i = 0; i < parts.length; i++) {
+      const part = parts[i];
+      const isFile = i === parts.length - 1;
+
+      if (isFile) {
+        node.children.push({
+          name: part,
+          type: "file",
+          size: obj.Size,
+          lastModified: obj.LastModified,
+        });
+      } else {
+        let folder = node.children.find((c) => c.name === part && c.type === "folder");
+        if (!folder) {
+          folder = { name: part, type: "folder", children: [] };
+          node.children.push(folder);
+        }
+        node = folder;
+      }
+    }
+  }
+
+  return root;
+}
+
+// --------------------------
+// /api/superadmin/tree endpoint
+// --------------------------
+app.get("/api/superadmin/tree", checkSuperadmin, async (_req, res) => {
+  try {
+    const allObjects = [];
+    let continuationToken;
+
+    do {
+      const response = await s3.send(
+        new ListObjectsV2Command({
+          Bucket: BUCKET_NAME,
+          ContinuationToken: continuationToken,
+        })
+      );
+      allObjects.push(...(response.Contents || []));
+      continuationToken = response.NextContinuationToken;
+    } while (continuationToken);
+
+    res.json({ ok: true, tree: buildTree(allObjects) });
+  } catch (err) {
+    console.error("Error in /api/superadmin/tree:", err);
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
+// --------------------------
+// /api/superadmin/photos endpoint
+// --------------------------
+app.get("/api/superadmin/photos", checkSuperadmin, async (req, res) => {
+  try {
+    const prefix = req.query.prefix || "";
+    const allObjects = [];
+    let continuationToken;
+
+    do {
+      const response = await s3.send(
+        new ListObjectsV2Command({
+          Bucket: BUCKET_NAME,
+          Prefix: prefix,
+          ContinuationToken: continuationToken,
+        })
+      );
+      allObjects.push(...(response.Contents || []));
+      continuationToken = response.NextContinuationToken;
+    } while (continuationToken);
+
+    const files = await Promise.all(
+      allObjects.map(async (obj) => ({
+        key: obj.Key,
+        url: await presignedUrl(obj.Key),
+        size: obj.Size,
+        lastModified: obj.LastModified,
+      }))
+    );
+
+    res.json({ ok: true, files });
+  } catch (err) {
+    console.error("Error in /api/superadmin/photos:", err);
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
+// --------------------------
+// /api/superadmin/file endpoint (delete single file)
+// --------------------------
+app.delete("/api/superadmin/file", checkSuperadmin, async (req, res) => {
+  try {
+    const { key } = req.body;
+    if (!key) return res.status(400).json({ ok: false, error: "Missing key" });
+
+    // Check existence first
+    const listResponse = await s3.send(
+      new ListObjectsV2Command({ Bucket: BUCKET_NAME, Prefix: key, MaxKeys: 1 })
+    );
+    const exists = (listResponse.Contents || []).some((obj) => obj.Key === key);
+    if (!exists) return res.status(404).json({ ok: false, error: "File not found" });
+
+    await s3.send(new DeleteObjectCommand({ Bucket: BUCKET_NAME, Key: key }));
+    res.json({ ok: true, deleted: key });
+  } catch (err) {
+    console.error("Error in DELETE /api/superadmin/file:", err);
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
+// --------------------------
+// /api/superadmin/folder endpoint (delete all files under prefix)
+// --------------------------
+app.delete("/api/superadmin/folder", checkSuperadmin, async (req, res) => {
+  try {
+    const { prefix } = req.body;
+    if (!prefix || prefix === "/") {
+      return res.status(400).json({ ok: false, error: "Invalid or empty prefix" });
+    }
+
+    const allKeys = [];
+    let continuationToken;
+
+    do {
+      const response = await s3.send(
+        new ListObjectsV2Command({
+          Bucket: BUCKET_NAME,
+          Prefix: prefix,
+          ContinuationToken: continuationToken,
+        })
+      );
+      allKeys.push(...(response.Contents || []).map((obj) => ({ Key: obj.Key })));
+      continuationToken = response.NextContinuationToken;
+    } while (continuationToken);
+
+    if (allKeys.length === 0) return res.json({ ok: true, deletedCount: 0 });
+
+    await s3.send(
+      new DeleteObjectsCommand({
+        Bucket: BUCKET_NAME,
+        Delete: { Objects: allKeys },
+      })
+    );
+
+    res.json({ ok: true, deletedCount: allKeys.length });
+  } catch (err) {
+    console.error("Error in DELETE /api/superadmin/folder:", err);
     res.status(500).json({ ok: false, error: err.message });
   }
 });
