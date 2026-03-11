@@ -151,39 +151,37 @@ app.delete("/api/superadmin/events/:eventId", checkSuperAdmin, async (req, res) 
 });
 
 // --------------------------
-// /api/superadmin/tree endpoint (S3 folder tree per event)
+// /api/superadmin/tree endpoint (S3 folder tree)
 // --------------------------
 app.get("/api/superadmin/tree", checkSuperAdmin, async (_req, res) => {
   try {
-    const [events, s3Response] = await Promise.all([
-      Event.find().sort({ created_at: -1 }),
-      s3.send(new ListObjectsV2Command({ Bucket: BUCKET_NAME, MaxKeys: 1000 })),
-    ]);
+    const s3Response = await s3.send(
+      new ListObjectsV2Command({ Bucket: BUCKET_NAME, MaxKeys: 5000 })
+    );
 
-    // Group S3 keys by event_id prefix
-    const folderMap = {};
+    // Build nested tree from flat S3 keys
+    const root = { name: "/", type: "folder", children: [] };
+
     for (const obj of s3Response.Contents || []) {
-      const parts = obj.Key.split("/");
-      if (parts.length < 2) continue;
-      const eventId = parts[0];
-      const folder = parts.length > 2 ? parts[1] : "root";
-      if (!folderMap[eventId]) folderMap[eventId] = {};
-      if (!folderMap[eventId][folder]) folderMap[eventId][folder] = 0;
-      folderMap[eventId][folder]++;
+      const parts = obj.Key.split("/").filter(Boolean);
+      if (parts.length === 0) continue;
+
+      let node = root;
+      for (let i = 0; i < parts.length; i++) {
+        const part = parts[i];
+        const isFile = i === parts.length - 1;
+        let child = node.children.find((c) => c.name === part);
+        if (!child) {
+          child = isFile
+            ? { name: part, type: "file", key: obj.Key }
+            : { name: part, type: "folder", children: [] };
+          node.children.push(child);
+        }
+        if (!isFile) node = child;
+      }
     }
 
-    const tree = events.map((e) => ({
-      event_id: e.event_id,
-      event_name: e.event_name,
-      is_active: e.is_active,
-      created_at: e.created_at,
-      folders: Object.entries(folderMap[e.event_id] || {}).map(([name, count]) => ({
-        name,
-        count,
-      })),
-    }));
-
-    res.json({ ok: true, tree });
+    res.json({ ok: true, tree: root });
   } catch (err) {
     console.error("Error fetching tree:", err);
     res.status(500).json({ ok: false, error: err.message });
