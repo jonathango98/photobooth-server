@@ -14,6 +14,8 @@ import {
 import { getSignedUrl } from "@aws-sdk/s3-request-presigner";
 import archiver from "archiver";
 import "dotenv/config";
+import { connectDB } from "./db.js";
+import Event from "./models/Event.js";
 
 // --------------------------
 // Railway Bucket (S3-compatible) configuration
@@ -29,7 +31,6 @@ const s3 = new S3Client({
 });
 
 const BUCKET_NAME = process.env.BUCKET_NAME;
-const EVENT_ID = process.env.EVENT_ID || "default";
 
 // --------------------------
 // __dirname replacement in ESM
@@ -67,6 +68,15 @@ const checkAdmin = (req, res, next) => {
   }
 };
 
+const checkSuperAdmin = (req, res, next) => {
+  const password = req.headers["x-superadmin-password"];
+  if (password === process.env.SUPERADMIN_PASSWORD) {
+    next();
+  } else {
+    res.status(401).json({ error: "Unauthorized" });
+  }
+};
+
 // --------------------------
 // Superadmin auth middleware
 // --------------------------
@@ -89,8 +99,261 @@ app.get("/health", (_req, res) => {
 // --------------------------
 // /api/event endpoint
 // --------------------------
-app.get("/api/event", (_req, res) => {
-  res.json({ eventId: EVENT_ID });
+app.get("/api/event", async (_req, res) => {
+  try {
+    const event = await Event.findOne({ is_active: true });
+    res.json({ eventId: event ? event.event_id : "test" });
+  } catch (err) {
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
+// --------------------------
+// /api/event/config endpoint (no auth required)
+// --------------------------
+app.get("/api/event/config", async (_req, res) => {
+  try {
+    const event = await Event.findOne({ is_active: true }) ?? await Event.findOne({ event_id: "test" });
+    if (!event) return res.status(404).json({ ok: false, error: "No active event found" });
+    res.json(event);
+  } catch (err) {
+    console.error("Error fetching event config:", err);
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
+// --------------------------
+// /api/superadmin/events CRUD endpoints
+// --------------------------
+app.get("/api/superadmin/events", checkSuperAdmin, async (_req, res) => {
+  try {
+    const events = await Event.find().sort({ created_at: -1 });
+    res.json({ ok: true, events });
+  } catch (err) {
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
+app.post("/api/superadmin/events", checkSuperAdmin, async (req, res) => {
+  try {
+    const existing = await Event.findOne({ event_id: req.body.event_id });
+    if (existing) return res.status(409).json({ ok: false, error: "event_id already exists" });
+    const event = await Event.create(req.body);
+    res.json({ ok: true, event });
+  } catch (err) {
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
+app.put("/api/superadmin/events/:eventId", checkSuperAdmin, async (req, res) => {
+  try {
+    if (req.body.is_active === true) {
+      await Event.updateMany({ event_id: { $ne: req.params.eventId } }, { is_active: false, updated_at: new Date() });
+    }
+    const event = await Event.findOneAndUpdate(
+      { event_id: req.params.eventId },
+      { ...req.body, updated_at: new Date() },
+      { new: true }
+    );
+    if (!event) return res.status(404).json({ ok: false, error: "Event not found" });
+    res.json({ ok: true, event });
+  } catch (err) {
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
+app.post("/api/superadmin/events/:eventId/activate", checkSuperAdmin, async (req, res) => {
+  try {
+    await Event.updateMany({}, { is_active: false, updated_at: new Date() });
+    const event = await Event.findOneAndUpdate(
+      { event_id: req.params.eventId },
+      { is_active: true, updated_at: new Date() },
+      { new: true }
+    );
+    if (!event) return res.status(404).json({ ok: false, error: "Event not found" });
+    res.json({ ok: true, event_id: event.event_id });
+  } catch (err) {
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
+app.delete("/api/superadmin/events/:eventId", checkSuperAdmin, async (req, res) => {
+  try {
+    const result = await Event.deleteOne({ event_id: req.params.eventId });
+    if (result.deletedCount === 0) return res.status(404).json({ ok: false, error: "Event not found" });
+    res.json({ ok: true });
+  } catch (err) {
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
+// --------------------------
+// /api/superadmin/tree endpoint (S3 folder tree)
+// --------------------------
+app.get("/api/superadmin/tree", checkSuperAdmin, async (_req, res) => {
+  try {
+    const s3Response = await s3.send(
+      new ListObjectsV2Command({ Bucket: BUCKET_NAME, MaxKeys: 5000 })
+    );
+
+    // Build nested tree from flat S3 keys
+    const root = { name: "/", type: "folder", children: [] };
+
+    for (const obj of s3Response.Contents || []) {
+      const parts = obj.Key.split("/").filter(Boolean);
+      if (parts.length === 0) continue;
+
+      let node = root;
+      for (let i = 0; i < parts.length; i++) {
+        const part = parts[i];
+        const isFile = i === parts.length - 1;
+        let child = node.children.find((c) => c.name === part);
+        if (!child) {
+          child = isFile
+            ? { name: part, type: "file", key: obj.Key }
+            : { name: part, type: "folder", children: [] };
+          node.children.push(child);
+        }
+        if (!isFile) node = child;
+      }
+    }
+
+    res.json({ ok: true, tree: root });
+  } catch (err) {
+    console.error("Error fetching tree:", err);
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
+// --------------------------
+// /api/superadmin/photos endpoint (list files by prefix)
+// --------------------------
+app.get("/api/superadmin/photos", checkSuperAdmin, async (req, res) => {
+  try {
+    const prefix = req.query.prefix || "";
+    const response = await s3.send(
+      new ListObjectsV2Command({ Bucket: BUCKET_NAME, Prefix: prefix, MaxKeys: 1000 })
+    );
+    const files = await Promise.all(
+      (response.Contents || []).map(async (obj) => ({
+        key: obj.Key,
+        url: await presignedUrl(obj.Key),
+        size: obj.Size,
+        lastModified: obj.LastModified,
+      }))
+    );
+    res.json({ ok: true, files });
+  } catch (err) {
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
+// --------------------------
+// /api/superadmin/file DELETE endpoint
+// --------------------------
+app.delete("/api/superadmin/file", checkSuperAdmin, async (req, res) => {
+  try {
+    const { key } = req.body;
+    if (!key) return res.status(400).json({ ok: false, error: "Missing key" });
+    await s3.send(new DeleteObjectCommand({ Bucket: BUCKET_NAME, Key: key }));
+    res.json({ ok: true });
+  } catch (err) {
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
+// --------------------------
+// /api/superadmin/folder DELETE endpoint
+// --------------------------
+app.delete("/api/superadmin/folder", checkSuperAdmin, async (req, res) => {
+  try {
+    const { prefix } = req.body;
+    if (!prefix) return res.status(400).json({ ok: false, error: "Missing prefix" });
+    const response = await s3.send(
+      new ListObjectsV2Command({ Bucket: BUCKET_NAME, Prefix: prefix, MaxKeys: 1000 })
+    );
+    await Promise.all(
+      (response.Contents || []).map((obj) =>
+        s3.send(new DeleteObjectCommand({ Bucket: BUCKET_NAME, Key: obj.Key }))
+      )
+    );
+    res.json({ ok: true });
+  } catch (err) {
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
+// --------------------------
+// /api/superadmin/move endpoint (copy + delete)
+// --------------------------
+app.post("/api/superadmin/move", checkSuperAdmin, async (req, res) => {
+  try {
+    const { sourceKey, destKey } = req.body;
+    if (!sourceKey || !destKey) return res.status(400).json({ ok: false, error: "Missing sourceKey or destKey" });
+    await s3.send(
+      new CopyObjectCommand({
+        Bucket: BUCKET_NAME,
+        CopySource: `${BUCKET_NAME}/${sourceKey}`,
+        Key: destKey,
+      })
+    );
+    await s3.send(new DeleteObjectCommand({ Bucket: BUCKET_NAME, Key: sourceKey }));
+    res.json({ ok: true });
+  } catch (err) {
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
+// --------------------------
+// /api/superadmin/download-zip endpoint
+// --------------------------
+app.get("/api/superadmin/download-zip", checkSuperAdmin, async (req, res) => {
+  try {
+    const prefix = req.query.prefix || "";
+    const response = await s3.send(
+      new ListObjectsV2Command({ Bucket: BUCKET_NAME, Prefix: prefix, MaxKeys: 1000 })
+    );
+    const archive = archiver("zip", { zlib: { level: 9 } });
+    res.attachment("photos.zip");
+    archive.pipe(res);
+    for (const obj of response.Contents || []) {
+      const filename = obj.Key.split("/").pop();
+      const s3Res = await s3.send(new GetObjectCommand({ Bucket: BUCKET_NAME, Key: obj.Key }));
+      archive.append(s3Res.Body, { name: filename });
+    }
+    await archive.finalize();
+  } catch (err) {
+    console.error("Error creating zip:", err);
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
+// --------------------------
+// /api/superadmin/download-selected endpoint
+// --------------------------
+app.post("/api/superadmin/download-selected", checkSuperAdmin, async (req, res) => {
+  try {
+    const { keys } = req.body;
+    if (!keys || !Array.isArray(keys) || keys.length === 0) {
+      return res.status(400).json({ ok: false, error: "Invalid keys array" });
+    }
+    const archive = archiver("zip", { zlib: { level: 9 } });
+    res.attachment("selected.zip");
+    archive.pipe(res);
+    for (const key of keys) {
+      try {
+        const filename = key.split("/").pop();
+        const s3Res = await s3.send(new GetObjectCommand({ Bucket: BUCKET_NAME, Key: key }));
+        archive.append(s3Res.Body, { name: filename });
+      } catch (err) {
+        console.warn(`Skipping ${key}:`, err.message);
+      }
+    }
+    await archive.finalize();
+  } catch (err) {
+    console.error("Error creating selected zip:", err);
+    res.status(500).json({ ok: false, error: err.message });
+  }
 });
 
 // --------------------------
@@ -147,6 +410,8 @@ app.post("/api/save", cpUpload, async (req, res) => {
   try {
     const files = req.files || {};
 
+    const activeEvent = await Event.findOne({ is_active: true });
+    const eventId = activeEvent ? activeEvent.event_id : "test";
     const sessionId = Date.now().toString();
 
     // 1) Upload raw photos
@@ -158,7 +423,7 @@ app.post("/api/save", cpUpload, async (req, res) => {
 
       const file = fileArr[0];
       const ext = extFromMime(file.mimetype);
-      const key = `${EVENT_ID}/raw/session_${sessionId}_raw${i + 1}${ext}`;
+      const key = `${eventId}/raw/session_${sessionId}_raw${i + 1}${ext}`;
       uploadPromises.push(uploadToS3(file.buffer, key, file.mimetype));
     }
 
@@ -171,7 +436,7 @@ app.post("/api/save", cpUpload, async (req, res) => {
 
     const collageFile = collageArr[0];
     const collageExt = extFromMime(collageFile.mimetype);
-    const collageKey = `${EVENT_ID}/collage/session_${sessionId}_collage${collageExt}`;
+    const collageKey = `${eventId}/collage/session_${sessionId}_collage${collageExt}`;
 
     await Promise.all([
       uploadToS3(collageFile.buffer, collageKey, collageFile.mimetype),
@@ -200,8 +465,10 @@ app.post("/api/save", cpUpload, async (req, res) => {
 // --------------------------
 app.get("/api/admin/photos", checkAdmin, async (_req, res) => {
   try {
+    const activeEvent = await Event.findOne({ is_active: true });
+    const eventId = activeEvent ? activeEvent.event_id : "test";
     const response = await s3.send(
-      new ListObjectsV2Command({ Bucket: BUCKET_NAME, Prefix: `${EVENT_ID}/`, MaxKeys: 500 })
+      new ListObjectsV2Command({ Bucket: BUCKET_NAME, Prefix: `${eventId}/`, MaxKeys: 500 })
     );
 
     const photos = await Promise.all(
@@ -229,8 +496,10 @@ app.get("/api/admin/photos", checkAdmin, async (_req, res) => {
 // --------------------------
 app.get("/api/admin/download-zip", checkAdmin, async (_req, res) => {
   try {
+    const activeEvent = await Event.findOne({ is_active: true });
+    const eventId = activeEvent ? activeEvent.event_id : "test";
     const response = await s3.send(
-      new ListObjectsV2Command({ Bucket: BUCKET_NAME, Prefix: `${EVENT_ID}/`, MaxKeys: 500 })
+      new ListObjectsV2Command({ Bucket: BUCKET_NAME, Prefix: `${eventId}/`, MaxKeys: 500 })
     );
 
     const archive = archiver("zip", { zlib: { level: 9 } });
@@ -554,6 +823,28 @@ app.post("/api/superadmin/move", checkSuperadmin, async (req, res) => {
 // --------------------------
 // Start server
 // --------------------------
-app.listen(PORT, () => {
-  console.log(`Photobooth server listening on http://localhost:${PORT}`);
-});
+(async () => {
+  await connectDB();
+
+  const anyEvent = await Event.findOne();
+  if (!anyEvent) {
+    await Event.create({
+      event_id: "test",
+      event_name: "IFGF NextGen Photo Booth",
+      templates: [
+        { name: "Template 1", file: "templates/template-1.png", preview: "templates/template-1.png", width: 1080, height: 1920, slots: [{ x: 100, y: 100 }, { x: 100, y: 639 }, { x: 100, y: 1178 }] },
+        { name: "Template 2", file: "templates/template-2.png", preview: "templates/template-2.png", width: 1080, height: 1920, slots: [{ x: 100, y: 100 }, { x: 100, y: 639 }, { x: 100, y: 1178 }] },
+        { name: "Template 3", file: "templates/template-3.png", preview: "templates/template-3.png", width: 1080, height: 1920, slots: [{ x: 100, y: 100 }, { x: 100, y: 639 }, { x: 100, y: 1178 }] },
+      ],
+      capture: { totalShots: 3, photoWidth: 880, photoHeight: 495 },
+      countdown: { seconds: 3, stepMs: 500 },
+      qr: { size: 300, margin: 1 },
+      is_active: true,
+    });
+    console.log('Seeded default "test" event');
+  }
+
+  app.listen(PORT, () => {
+    console.log(`Photobooth server listening on http://localhost:${PORT}`);
+  });
+})();
