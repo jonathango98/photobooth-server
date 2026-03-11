@@ -72,6 +72,13 @@ app.get("/health", (_req, res) => {
 });
 
 // --------------------------
+// /api/event endpoint
+// --------------------------
+app.get("/api/event", (_req, res) => {
+  res.json({ eventId: EVENT_ID });
+});
+
+// --------------------------
 // Multer setup (in-memory)
 // --------------------------
 const upload = multer({
