@@ -31,7 +31,6 @@ const s3 = new S3Client({
 });
 
 const BUCKET_NAME = process.env.BUCKET_NAME;
-const EVENT_ID = process.env.EVENT_ID || "default";
 
 // --------------------------
 // __dirname replacement in ESM
@@ -100,8 +99,13 @@ app.get("/health", (_req, res) => {
 // --------------------------
 // /api/event endpoint
 // --------------------------
-app.get("/api/event", (_req, res) => {
-  res.json({ eventId: EVENT_ID });
+app.get("/api/event", async (_req, res) => {
+  try {
+    const event = await Event.findOne({ is_active: true });
+    res.json({ eventId: event ? event.event_id : "test" });
+  } catch (err) {
+    res.status(500).json({ ok: false, error: err.message });
+  }
 });
 
 // --------------------------
@@ -406,6 +410,8 @@ app.post("/api/save", cpUpload, async (req, res) => {
   try {
     const files = req.files || {};
 
+    const activeEvent = await Event.findOne({ is_active: true });
+    const eventId = activeEvent ? activeEvent.event_id : "test";
     const sessionId = Date.now().toString();
 
     // 1) Upload raw photos
@@ -417,7 +423,7 @@ app.post("/api/save", cpUpload, async (req, res) => {
 
       const file = fileArr[0];
       const ext = extFromMime(file.mimetype);
-      const key = `${EVENT_ID}/raw/session_${sessionId}_raw${i + 1}${ext}`;
+      const key = `${eventId}/raw/session_${sessionId}_raw${i + 1}${ext}`;
       uploadPromises.push(uploadToS3(file.buffer, key, file.mimetype));
     }
 
@@ -430,7 +436,7 @@ app.post("/api/save", cpUpload, async (req, res) => {
 
     const collageFile = collageArr[0];
     const collageExt = extFromMime(collageFile.mimetype);
-    const collageKey = `${EVENT_ID}/collage/session_${sessionId}_collage${collageExt}`;
+    const collageKey = `${eventId}/collage/session_${sessionId}_collage${collageExt}`;
 
     await Promise.all([
       uploadToS3(collageFile.buffer, collageKey, collageFile.mimetype),
@@ -459,8 +465,10 @@ app.post("/api/save", cpUpload, async (req, res) => {
 // --------------------------
 app.get("/api/admin/photos", checkAdmin, async (_req, res) => {
   try {
+    const activeEvent = await Event.findOne({ is_active: true });
+    const eventId = activeEvent ? activeEvent.event_id : "test";
     const response = await s3.send(
-      new ListObjectsV2Command({ Bucket: BUCKET_NAME, Prefix: `${EVENT_ID}/`, MaxKeys: 500 })
+      new ListObjectsV2Command({ Bucket: BUCKET_NAME, Prefix: `${eventId}/`, MaxKeys: 500 })
     );
 
     const photos = await Promise.all(
@@ -488,8 +496,10 @@ app.get("/api/admin/photos", checkAdmin, async (_req, res) => {
 // --------------------------
 app.get("/api/admin/download-zip", checkAdmin, async (_req, res) => {
   try {
+    const activeEvent = await Event.findOne({ is_active: true });
+    const eventId = activeEvent ? activeEvent.event_id : "test";
     const response = await s3.send(
-      new ListObjectsV2Command({ Bucket: BUCKET_NAME, Prefix: `${EVENT_ID}/`, MaxKeys: 500 })
+      new ListObjectsV2Command({ Bucket: BUCKET_NAME, Prefix: `${eventId}/`, MaxKeys: 500 })
     );
 
     const archive = archiver("zip", { zlib: { level: 9 } });
@@ -816,10 +826,10 @@ app.post("/api/superadmin/move", checkSuperadmin, async (req, res) => {
 (async () => {
   await connectDB();
 
-  const existing = await Event.findOne({ event_id: EVENT_ID });
-  if (!existing) {
+  const anyEvent = await Event.findOne();
+  if (!anyEvent) {
     await Event.create({
-      event_id: EVENT_ID,
+      event_id: "test",
       event_name: "IFGF NextGen Photo Booth",
       templates: [
         { name: "Template 1", file: "templates/template-1.png", preview: "templates/template-1.png", width: 1080, height: 1920, slots: [{ x: 100, y: 100 }, { x: 100, y: 639 }, { x: 100, y: 1178 }] },
@@ -831,7 +841,7 @@ app.post("/api/superadmin/move", checkSuperadmin, async (req, res) => {
       qr: { size: 300, margin: 1 },
       is_active: true,
     });
-    console.log(`Seeded default event for EVENT_ID="${EVENT_ID}"`);
+    console.log('Seeded default "test" event');
   }
 
   app.listen(PORT, () => {
