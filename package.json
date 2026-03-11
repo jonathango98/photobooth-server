@@ -1,0 +1,20 @@
+{
+  "name": "booth-server",
+  "version": "1.0.0",
+  "description": "Booth server application",
+  "main": "server.js",
+  "type": "module",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node --watch server.js"
+  },
+  "dependencies": {
+    "express": "^4.18.2",
+    "cloudinary": "^2.9.0",
+    "multer": "^2.0.2",
+    "archiver": "^6.0.0",
+    "axios": "^1.6.0",
+    "dotenv": "^17.3.1"
+  },
+  "devDependencies": {}
+}
