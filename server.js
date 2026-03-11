@@ -9,6 +9,7 @@ import {
   GetObjectCommand,
   DeleteObjectCommand,
   DeleteObjectsCommand,
+  CopyObjectCommand,
 } from "@aws-sdk/client-s3";
 import { getSignedUrl } from "@aws-sdk/s3-request-presigner";
 import archiver from "archiver";
@@ -46,7 +47,7 @@ app.use(express.static(path.join(__dirname, "public")));
 
 app.use((req, res, next) => {
   res.header("Access-Control-Allow-Origin", "*");
-  res.header("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS");
+  res.header("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS");
   res.header("Access-Control-Allow-Headers", "Content-Type, x-admin-password, x-superadmin-password");
   if (req.method === "OPTIONS") return res.sendStatus(200);
   next();
@@ -445,6 +446,107 @@ app.delete("/api/superadmin/folder", checkSuperadmin, async (req, res) => {
     res.json({ ok: true, deletedCount: allKeys.length });
   } catch (err) {
     console.error("Error in DELETE /api/superadmin/folder:", err);
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
+// --------------------------
+// /api/superadmin/download-zip endpoint (download all or prefix as zip)
+// --------------------------
+app.get("/api/superadmin/download-zip", checkSuperadmin, async (req, res) => {
+  try {
+    const prefix = req.query.prefix || "";
+    const allObjects = [];
+    let continuationToken;
+
+    do {
+      const response = await s3.send(
+        new ListObjectsV2Command({
+          Bucket: BUCKET_NAME,
+          Prefix: prefix,
+          ContinuationToken: continuationToken,
+        })
+      );
+      allObjects.push(...(response.Contents || []));
+      continuationToken = response.NextContinuationToken;
+    } while (continuationToken);
+
+    const archive = archiver("zip", { zlib: { level: 9 } });
+    res.attachment("download.zip");
+    archive.pipe(res);
+
+    for (const obj of allObjects) {
+      const s3Response = await s3.send(
+        new GetObjectCommand({ Bucket: BUCKET_NAME, Key: obj.Key })
+      );
+      archive.append(s3Response.Body, { name: obj.Key });
+    }
+
+    await archive.finalize();
+  } catch (err) {
+    console.error("Error in /api/superadmin/download-zip:", err);
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
+// --------------------------
+// /api/superadmin/download-selected endpoint (download selected files as zip)
+// --------------------------
+app.post("/api/superadmin/download-selected", checkSuperadmin, async (req, res) => {
+  try {
+    const { keys } = req.body;
+    if (!keys || !Array.isArray(keys) || keys.length === 0) {
+      return res.status(400).json({ ok: false, error: "Invalid keys array" });
+    }
+
+    const archive = archiver("zip", { zlib: { level: 9 } });
+    res.attachment("selected.zip");
+    archive.pipe(res);
+
+    for (const key of keys) {
+      try {
+        const s3Response = await s3.send(
+          new GetObjectCommand({ Bucket: BUCKET_NAME, Key: key })
+        );
+        archive.append(s3Response.Body, { name: key });
+      } catch (err) {
+        console.warn(`Skipping ${key}:`, err.message);
+      }
+    }
+
+    await archive.finalize();
+  } catch (err) {
+    console.error("Error in /api/superadmin/download-selected:", err);
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
+// --------------------------
+// /api/superadmin/move endpoint (move/rename a file)
+// --------------------------
+app.post("/api/superadmin/move", checkSuperadmin, async (req, res) => {
+  try {
+    const { sourceKey, destKey } = req.body;
+    if (!sourceKey || !destKey) {
+      return res.status(400).json({ ok: false, error: "Missing sourceKey or destKey" });
+    }
+    if (sourceKey === destKey) {
+      return res.status(400).json({ ok: false, error: "Source and destination are the same" });
+    }
+
+    await s3.send(
+      new CopyObjectCommand({
+        Bucket: BUCKET_NAME,
+        CopySource: `${BUCKET_NAME}/${sourceKey}`,
+        Key: destKey,
+      })
+    );
+
+    await s3.send(new DeleteObjectCommand({ Bucket: BUCKET_NAME, Key: sourceKey }));
+
+    res.json({ ok: true, moved: { from: sourceKey, to: destKey } });
+  } catch (err) {
+    console.error("Error in /api/superadmin/move:", err);
     res.status(500).json({ ok: false, error: err.message });
   }
 });
