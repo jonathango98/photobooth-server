@@ -7,6 +7,8 @@ import {
   PutObjectCommand,
   ListObjectsV2Command,
   GetObjectCommand,
+  DeleteObjectCommand,
+  CopyObjectCommand,
 } from "@aws-sdk/client-s3";
 import { getSignedUrl } from "@aws-sdk/s3-request-presigner";
 import archiver from "archiver";
@@ -184,6 +186,137 @@ app.get("/api/superadmin/tree", checkSuperAdmin, async (_req, res) => {
     res.json({ ok: true, tree: root });
   } catch (err) {
     console.error("Error fetching tree:", err);
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
+// --------------------------
+// /api/superadmin/photos endpoint (list files by prefix)
+// --------------------------
+app.get("/api/superadmin/photos", checkSuperAdmin, async (req, res) => {
+  try {
+    const prefix = req.query.prefix || "";
+    const response = await s3.send(
+      new ListObjectsV2Command({ Bucket: BUCKET_NAME, Prefix: prefix, MaxKeys: 1000 })
+    );
+    const files = await Promise.all(
+      (response.Contents || []).map(async (obj) => ({
+        key: obj.Key,
+        url: await presignedUrl(obj.Key),
+        size: obj.Size,
+        lastModified: obj.LastModified,
+      }))
+    );
+    res.json({ ok: true, files });
+  } catch (err) {
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
+// --------------------------
+// /api/superadmin/file DELETE endpoint
+// --------------------------
+app.delete("/api/superadmin/file", checkSuperAdmin, async (req, res) => {
+  try {
+    const { key } = req.body;
+    if (!key) return res.status(400).json({ ok: false, error: "Missing key" });
+    await s3.send(new DeleteObjectCommand({ Bucket: BUCKET_NAME, Key: key }));
+    res.json({ ok: true });
+  } catch (err) {
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
+// --------------------------
+// /api/superadmin/folder DELETE endpoint
+// --------------------------
+app.delete("/api/superadmin/folder", checkSuperAdmin, async (req, res) => {
+  try {
+    const { prefix } = req.body;
+    if (!prefix) return res.status(400).json({ ok: false, error: "Missing prefix" });
+    const response = await s3.send(
+      new ListObjectsV2Command({ Bucket: BUCKET_NAME, Prefix: prefix, MaxKeys: 1000 })
+    );
+    await Promise.all(
+      (response.Contents || []).map((obj) =>
+        s3.send(new DeleteObjectCommand({ Bucket: BUCKET_NAME, Key: obj.Key }))
+      )
+    );
+    res.json({ ok: true });
+  } catch (err) {
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
+// --------------------------
+// /api/superadmin/move endpoint (copy + delete)
+// --------------------------
+app.post("/api/superadmin/move", checkSuperAdmin, async (req, res) => {
+  try {
+    const { sourceKey, destKey } = req.body;
+    if (!sourceKey || !destKey) return res.status(400).json({ ok: false, error: "Missing sourceKey or destKey" });
+    await s3.send(
+      new CopyObjectCommand({
+        Bucket: BUCKET_NAME,
+        CopySource: `${BUCKET_NAME}/${sourceKey}`,
+        Key: destKey,
+      })
+    );
+    await s3.send(new DeleteObjectCommand({ Bucket: BUCKET_NAME, Key: sourceKey }));
+    res.json({ ok: true });
+  } catch (err) {
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
+// --------------------------
+// /api/superadmin/download-zip endpoint
+// --------------------------
+app.get("/api/superadmin/download-zip", checkSuperAdmin, async (req, res) => {
+  try {
+    const prefix = req.query.prefix || "";
+    const response = await s3.send(
+      new ListObjectsV2Command({ Bucket: BUCKET_NAME, Prefix: prefix, MaxKeys: 1000 })
+    );
+    const archive = archiver("zip", { zlib: { level: 9 } });
+    res.attachment("photos.zip");
+    archive.pipe(res);
+    for (const obj of response.Contents || []) {
+      const filename = obj.Key.split("/").pop();
+      const s3Res = await s3.send(new GetObjectCommand({ Bucket: BUCKET_NAME, Key: obj.Key }));
+      archive.append(s3Res.Body, { name: filename });
+    }
+    await archive.finalize();
+  } catch (err) {
+    console.error("Error creating zip:", err);
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
+// --------------------------
+// /api/superadmin/download-selected endpoint
+// --------------------------
+app.post("/api/superadmin/download-selected", checkSuperAdmin, async (req, res) => {
+  try {
+    const { keys } = req.body;
+    if (!keys || !Array.isArray(keys) || keys.length === 0) {
+      return res.status(400).json({ ok: false, error: "Invalid keys array" });
+    }
+    const archive = archiver("zip", { zlib: { level: 9 } });
+    res.attachment("selected.zip");
+    archive.pipe(res);
+    for (const key of keys) {
+      try {
+        const filename = key.split("/").pop();
+        const s3Res = await s3.send(new GetObjectCommand({ Bucket: BUCKET_NAME, Key: key }));
+        archive.append(s3Res.Body, { name: filename });
+      } catch (err) {
+        console.warn(`Skipping ${key}:`, err.message);
+      }
+    }
+    await archive.finalize();
+  } catch (err) {
+    console.error("Error creating selected zip:", err);
     res.status(500).json({ ok: false, error: err.message });
   }
 });
