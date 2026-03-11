@@ -2,19 +2,30 @@ import express from "express";
 import path from "path";
 import multer from "multer";
 import { fileURLToPath } from "url";
-import { v2 as cloudinary } from "cloudinary";
+import {
+  S3Client,
+  PutObjectCommand,
+  ListObjectsV2Command,
+  GetObjectCommand,
+} from "@aws-sdk/client-s3";
+import { getSignedUrl } from "@aws-sdk/s3-request-presigner";
 import archiver from "archiver";
-import axios from "axios";
 import "dotenv/config";
 
 // --------------------------
-// Cloudinary configuration
+// Railway Bucket (S3-compatible) configuration
 // --------------------------
-cloudinary.config({
-  cloud_name: process.env.CLOUDINARY_CLOUD_NAME,
-  api_key: process.env.CLOUDINARY_API_KEY,
-  api_secret: process.env.CLOUDINARY_API_SECRET,
+const s3 = new S3Client({
+  region: process.env.AWS_REGION || "auto",
+  endpoint: process.env.AWS_ENDPOINT_URL_S3,
+  credentials: {
+    accessKeyId: process.env.AWS_ACCESS_KEY_ID,
+    secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY,
+  },
+  forcePathStyle: true,
 });
+
+const BUCKET_NAME = process.env.BUCKET_NAME;
 
 // --------------------------
 // __dirname replacement in ESM
@@ -32,6 +43,13 @@ const PORT = process.env.PORT || 3000;
 app.use(express.static(path.join(__dirname, "public")));
 
 // --------------------------
+// /health endpoint (health check)
+// --------------------------
+app.get("/health", (_req, res) => {
+  res.json({ ok: true });
+});
+
+// --------------------------
 // Multer setup (in-memory)
 // --------------------------
 const upload = multer({
@@ -41,21 +59,34 @@ const upload = multer({
   },
 });
 
-// Helper for uploading buffer to Cloudinary
-function uploadFromBuffer(buffer, folder, filename) {
-  return new Promise((resolve, reject) => {
-    const stream = cloudinary.uploader.upload_stream(
-      {
-        folder: folder,
-        public_id: filename.replace(/\.[^/.]+$/, ""), // Remove extension
-        resource_type: "auto",
-      },
-      (error, result) => {
-        if (error) return reject(error);
-        resolve(result);
-      }
-    );
-    stream.end(buffer);
+// Helper: get file extension from mimetype
+function extFromMime(mimetype) {
+  const map = {
+    "image/jpeg": ".jpg",
+    "image/png": ".png",
+    "image/gif": ".gif",
+    "image/webp": ".webp",
+    "image/bmp": ".bmp",
+  };
+  return map[mimetype] || ".bin";
+}
+
+// Helper: upload buffer to S3
+async function uploadToS3(buffer, key, contentType) {
+  await s3.send(
+    new PutObjectCommand({
+      Bucket: BUCKET_NAME,
+      Key: key,
+      Body: buffer,
+      ContentType: contentType,
+    })
+  );
+}
+
+// Helper: generate a presigned GET URL (7-day max)
+async function presignedUrl(key) {
+  return getSignedUrl(s3, new GetObjectCommand({ Bucket: BUCKET_NAME, Key: key }), {
+    expiresIn: 604800, // 7 days
   });
 }
 
@@ -74,10 +105,9 @@ app.post("/api/save", cpUpload, async (req, res) => {
     const files = req.files || {};
     console.log("Received files:", Object.keys(files));
 
-    // Simple session id for grouping
     const sessionId = Date.now().toString();
 
-    // 1) Save raw photos to Cloudinary
+    // 1) Upload raw photos
     const rawFields = ["raw1", "raw2", "raw3"];
     const uploadPromises = [];
 
@@ -86,11 +116,12 @@ app.post("/api/save", cpUpload, async (req, res) => {
       if (!fileArr || fileArr.length === 0) return;
 
       const file = fileArr[0];
-      const rawFilename = `session_${sessionId}_raw${index + 1}`;
-      uploadPromises.push(uploadFromBuffer(file.buffer, "raw", rawFilename));
+      const ext = extFromMime(file.mimetype);
+      const key = `raw/session_${sessionId}_raw${index + 1}${ext}`;
+      uploadPromises.push(uploadToS3(file.buffer, key, file.mimetype));
     });
 
-    // 2) Save collage to Cloudinary
+    // 2) Upload collage
     const collageArr = files["collage"];
     if (!collageArr || collageArr.length === 0) {
       console.error("No collage file received");
@@ -98,21 +129,20 @@ app.post("/api/save", cpUpload, async (req, res) => {
     }
 
     const collageFile = collageArr[0];
-    const collageFilename = `session_${sessionId}_collage`;
-    const collageUploadPromise = uploadFromBuffer(collageFile.buffer, "collage", collageFilename);
+    const collageExt = extFromMime(collageFile.mimetype);
+    const collageKey = `collage/session_${sessionId}_collage${collageExt}`;
 
-    // Wait for all uploads to complete
-    const [collageResult] = await Promise.all([
-      collageUploadPromise,
+    await Promise.all([
+      uploadToS3(collageFile.buffer, collageKey, collageFile.mimetype),
       ...uploadPromises,
     ]);
 
-    console.log("Uploaded collage:", collageResult.secure_url);
+    // 3) Generate presigned URL for collage (for QR code, valid 7 days)
+    const collageUrl = await presignedUrl(collageKey);
 
-    // 3) Build web URL for collage (for QR code)
-    const collageUrl = collageResult.secure_url;
+    console.log("Uploaded collage:", collageKey);
 
-    // 4) Respond JSON (frontend expects .json() with collageUrl)
+    // 4) Respond JSON
     res.json({
       ok: true,
       sessionId,
@@ -125,27 +155,28 @@ app.post("/api/save", cpUpload, async (req, res) => {
 });
 
 // --------------------------
-// /api/admin/photos endpoint (get list of photos)
+// /api/admin/photos endpoint (list all photos)
 // --------------------------
-app.get("/api/admin/photos", async (req, res) => {
+app.get("/api/admin/photos", async (_req, res) => {
   try {
-    const resources = await cloudinary.api.resources({
-      type: "upload",
-      max_results: 500,
-    });
+    const response = await s3.send(
+      new ListObjectsV2Command({ Bucket: BUCKET_NAME, MaxKeys: 500 })
+    );
 
-    const photos = resources.resources.map((resource) => ({
-      id: resource.public_id,
-      url: resource.secure_url,
-      uploadedAt: resource.created_at,
-      folder: resource.folder || "root",
-    }));
+    const photos = await Promise.all(
+      (response.Contents || []).map(async (obj) => {
+        const url = await presignedUrl(obj.Key);
+        const parts = obj.Key.split("/");
+        return {
+          id: obj.Key,
+          url,
+          uploadedAt: obj.LastModified,
+          folder: parts.length > 1 ? parts[0] : "root",
+        };
+      })
+    );
 
-    res.json({
-      ok: true,
-      photos,
-      total: photos.length,
-    });
+    res.json({ ok: true, photos, total: photos.length });
   } catch (err) {
     console.error("Error fetching photos:", err);
     res.status(500).json({ ok: false, error: err.message });
@@ -155,24 +186,23 @@ app.get("/api/admin/photos", async (req, res) => {
 // --------------------------
 // /api/admin/download-zip endpoint (download all photos as zip)
 // --------------------------
-app.get("/api/admin/download-zip", async (req, res) => {
+app.get("/api/admin/download-zip", async (_req, res) => {
   try {
-    const resources = await cloudinary.api.resources({
-      type: "upload",
-      max_results: 500,
-    });
+    const response = await s3.send(
+      new ListObjectsV2Command({ Bucket: BUCKET_NAME, MaxKeys: 500 })
+    );
 
     const archive = archiver("zip", { zlib: { level: 9 } });
 
     res.attachment("photos.zip");
     archive.pipe(res);
 
-    for (const resource of resources.resources) {
-      const filename = resource.public_id.split("/").pop() + "." + resource.format;
-      const fileStream = await axios.get(resource.secure_url, {
-        responseType: "stream",
-      });
-      archive.append(fileStream.data, { name: filename });
+    for (const obj of response.Contents || []) {
+      const filename = obj.Key.split("/").pop();
+      const s3Response = await s3.send(
+        new GetObjectCommand({ Bucket: BUCKET_NAME, Key: obj.Key })
+      );
+      archive.append(s3Response.Body, { name: filename });
     }
 
     await archive.finalize();
@@ -190,10 +220,7 @@ app.post("/api/admin/download-selected", express.json(), async (req, res) => {
     const { photoIds } = req.body;
 
     if (!photoIds || !Array.isArray(photoIds) || photoIds.length === 0) {
-      return res.status(400).json({
-        ok: false,
-        error: "Invalid photoIds array",
-      });
+      return res.status(400).json({ ok: false, error: "Invalid photoIds array" });
     }
 
     const archive = archiver("zip", { zlib: { level: 9 } });
@@ -201,16 +228,15 @@ app.post("/api/admin/download-selected", express.json(), async (req, res) => {
     res.attachment("selected-photos.zip");
     archive.pipe(res);
 
-    for (const photoId of photoIds) {
+    for (const key of photoIds) {
       try {
-        const resource = await cloudinary.api.resource(photoId);
-        const filename = photoId.split("/").pop() + "." + resource.format;
-        const fileStream = await axios.get(resource.secure_url, {
-          responseType: "stream",
-        });
-        archive.append(fileStream.data, { name: filename });
+        const filename = key.split("/").pop();
+        const s3Response = await s3.send(
+          new GetObjectCommand({ Bucket: BUCKET_NAME, Key: key })
+        );
+        archive.append(s3Response.Body, { name: filename });
       } catch (err) {
-        console.warn(`Failed to download ${photoId}:`, err.message);
+        console.warn(`Failed to download ${key}:`, err.message);
       }
     }
 
