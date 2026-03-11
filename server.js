@@ -109,8 +109,8 @@ app.get("/api/event", (_req, res) => {
 // --------------------------
 app.get("/api/event/config", async (_req, res) => {
   try {
-    const event = await Event.findOne({ event_id: EVENT_ID });
-    if (!event) return res.status(404).json({ ok: false, error: "Event not found" });
+    const event = await Event.findOne({ is_active: true }) ?? await Event.findOne({ event_id: "test" });
+    if (!event) return res.status(404).json({ ok: false, error: "No active event found" });
     res.json(event);
   } catch (err) {
     console.error("Error fetching event config:", err);
@@ -143,6 +143,9 @@ app.post("/api/superadmin/events", checkSuperAdmin, async (req, res) => {
 
 app.put("/api/superadmin/events/:eventId", checkSuperAdmin, async (req, res) => {
   try {
+    if (req.body.is_active === true) {
+      await Event.updateMany({ event_id: { $ne: req.params.eventId } }, { is_active: false, updated_at: new Date() });
+    }
     const event = await Event.findOneAndUpdate(
       { event_id: req.params.eventId },
       { ...req.body, updated_at: new Date() },
@@ -150,6 +153,21 @@ app.put("/api/superadmin/events/:eventId", checkSuperAdmin, async (req, res) => 
     );
     if (!event) return res.status(404).json({ ok: false, error: "Event not found" });
     res.json({ ok: true, event });
+  } catch (err) {
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
+app.post("/api/superadmin/events/:eventId/activate", checkSuperAdmin, async (req, res) => {
+  try {
+    await Event.updateMany({}, { is_active: false, updated_at: new Date() });
+    const event = await Event.findOneAndUpdate(
+      { event_id: req.params.eventId },
+      { is_active: true, updated_at: new Date() },
+      { new: true }
+    );
+    if (!event) return res.status(404).json({ ok: false, error: "Event not found" });
+    res.json({ ok: true, event_id: event.event_id });
   } catch (err) {
     res.status(500).json({ ok: false, error: err.message });
   }
