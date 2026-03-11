@@ -11,6 +11,8 @@ import {
 import { getSignedUrl } from "@aws-sdk/s3-request-presigner";
 import archiver from "archiver";
 import "dotenv/config";
+import { connectDB } from "./db.js";
+import Event from "./models/Event.js";
 
 // --------------------------
 // Railway Bucket (S3-compatible) configuration
@@ -44,8 +46,8 @@ app.use(express.static(path.join(__dirname, "public")));
 
 app.use((req, res, next) => {
   res.header("Access-Control-Allow-Origin", "*");
-  res.header("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
-  res.header("Access-Control-Allow-Headers", "Content-Type, x-admin-password");
+  res.header("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS");
+  res.header("Access-Control-Allow-Headers", "Content-Type, x-admin-password, x-superadmin-password");
   if (req.method === "OPTIONS") return res.sendStatus(200);
   next();
 });
@@ -64,6 +66,15 @@ const checkAdmin = (req, res, next) => {
   }
 };
 
+const checkSuperAdmin = (req, res, next) => {
+  const password = req.headers["x-superadmin-password"];
+  if (password === process.env.SUPERADMIN_PASSWORD) {
+    next();
+  } else {
+    res.status(401).json({ error: "Unauthorized" });
+  }
+};
+
 // --------------------------
 // /health endpoint (health check)
 // --------------------------
@@ -76,6 +87,67 @@ app.get("/health", (_req, res) => {
 // --------------------------
 app.get("/api/event", (_req, res) => {
   res.json({ eventId: EVENT_ID });
+});
+
+// --------------------------
+// /api/event/config endpoint (no auth required)
+// --------------------------
+app.get("/api/event/config", async (_req, res) => {
+  try {
+    const event = await Event.findOne({ event_id: EVENT_ID });
+    if (!event) return res.status(404).json({ ok: false, error: "Event not found" });
+    res.json(event);
+  } catch (err) {
+    console.error("Error fetching event config:", err);
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
+// --------------------------
+// /api/superadmin/events CRUD endpoints
+// --------------------------
+app.get("/api/superadmin/events", checkSuperAdmin, async (_req, res) => {
+  try {
+    const events = await Event.find().sort({ created_at: -1 });
+    res.json({ ok: true, events });
+  } catch (err) {
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
+app.post("/api/superadmin/events", checkSuperAdmin, async (req, res) => {
+  try {
+    const existing = await Event.findOne({ event_id: req.body.event_id });
+    if (existing) return res.status(409).json({ ok: false, error: "event_id already exists" });
+    const event = await Event.create(req.body);
+    res.json({ ok: true, event });
+  } catch (err) {
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
+app.put("/api/superadmin/events/:eventId", checkSuperAdmin, async (req, res) => {
+  try {
+    const event = await Event.findOneAndUpdate(
+      { event_id: req.params.eventId },
+      { ...req.body, updated_at: new Date() },
+      { new: true }
+    );
+    if (!event) return res.status(404).json({ ok: false, error: "Event not found" });
+    res.json({ ok: true, event });
+  } catch (err) {
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
+app.delete("/api/superadmin/events/:eventId", checkSuperAdmin, async (req, res) => {
+  try {
+    const result = await Event.deleteOne({ event_id: req.params.eventId });
+    if (result.deletedCount === 0) return res.status(404).json({ ok: false, error: "Event not found" });
+    res.json({ ok: true });
+  } catch (err) {
+    res.status(500).json({ ok: false, error: err.message });
+  }
 });
 
 // --------------------------
@@ -276,6 +348,28 @@ app.post("/api/admin/download-selected", checkAdmin, async (req, res) => {
 // --------------------------
 // Start server
 // --------------------------
-app.listen(PORT, () => {
-  console.log(`Photobooth server listening on http://localhost:${PORT}`);
-});
+(async () => {
+  await connectDB();
+
+  const existing = await Event.findOne({ event_id: EVENT_ID });
+  if (!existing) {
+    await Event.create({
+      event_id: EVENT_ID,
+      event_name: "IFGF NextGen Photo Booth",
+      templates: [
+        { name: "Template 1", file: "templates/template-1.png", preview: "templates/template-1.png", width: 1080, height: 1920, slots: [{ x: 100, y: 100 }, { x: 100, y: 639 }, { x: 100, y: 1178 }] },
+        { name: "Template 2", file: "templates/template-2.png", preview: "templates/template-2.png", width: 1080, height: 1920, slots: [{ x: 100, y: 100 }, { x: 100, y: 639 }, { x: 100, y: 1178 }] },
+        { name: "Template 3", file: "templates/template-3.png", preview: "templates/template-3.png", width: 1080, height: 1920, slots: [{ x: 100, y: 100 }, { x: 100, y: 639 }, { x: 100, y: 1178 }] },
+      ],
+      capture: { totalShots: 3, photoWidth: 880, photoHeight: 495 },
+      countdown: { seconds: 3, stepMs: 500 },
+      qr: { size: 300, margin: 1 },
+      is_active: true,
+    });
+    console.log(`Seeded default event for EVENT_ID="${EVENT_ID}"`);
+  }
+
+  app.listen(PORT, () => {
+    console.log(`Photobooth server listening on http://localhost:${PORT}`);
+  });
+})();
