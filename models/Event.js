@@ -30,6 +30,12 @@ const eventSchema = new mongoose.Schema({
     seconds: Number,
     stepMs: Number,
   },
+  gestureTrigger: {
+    enabled: { type: Boolean, default: false },
+    gestureType: { type: String, default: "peace" },
+    holdDuration: { type: Number, default: 1000 },
+    detectionFps: { type: Number, default: 10 },
+  },
   qr: {
     size: Number,
     margin: Number,
