@@ -113,7 +113,7 @@ app.get("/api/event/config", async (_req, res) => {
 // --------------------------
 // /api/superadmin/events CRUD endpoints
 // --------------------------
-app.get("/api/superadmin/events", checkSuperAdmin, async (_req, res) => {
+app.get("/api/superadmin/events", checkSuperadmin, async (_req, res) => {
   try {
     const events = await Event.find().sort({ created_at: -1 });
     res.json({ ok: true, events });
@@ -122,7 +122,7 @@ app.get("/api/superadmin/events", checkSuperAdmin, async (_req, res) => {
   }
 });
 
-app.post("/api/superadmin/events", checkSuperAdmin, async (req, res) => {
+app.post("/api/superadmin/events", checkSuperadmin, async (req, res) => {
   try {
     const existing = await Event.findOne({ event_id: req.body.event_id });
     if (existing) return res.status(409).json({ ok: false, error: "event_id already exists" });
@@ -133,7 +133,7 @@ app.post("/api/superadmin/events", checkSuperAdmin, async (req, res) => {
   }
 });
 
-app.put("/api/superadmin/events/:eventId", checkSuperAdmin, async (req, res) => {
+app.put("/api/superadmin/events/:eventId", checkSuperadmin, async (req, res) => {
   try {
     if (req.body.is_active === true) {
       await Event.updateMany({ event_id: { $ne: req.params.eventId } }, { is_active: false, updated_at: new Date() });
@@ -150,7 +150,7 @@ app.put("/api/superadmin/events/:eventId", checkSuperAdmin, async (req, res) => 
   }
 });
 
-app.post("/api/superadmin/events/:eventId/activate", checkSuperAdmin, async (req, res) => {
+app.post("/api/superadmin/events/:eventId/activate", checkSuperadmin, async (req, res) => {
   try {
     await Event.updateMany({}, { is_active: false, updated_at: new Date() });
     const event = await Event.findOneAndUpdate(
@@ -165,7 +165,7 @@ app.post("/api/superadmin/events/:eventId/activate", checkSuperAdmin, async (req
   }
 });
 
-app.delete("/api/superadmin/events/:eventId", checkSuperAdmin, async (req, res) => {
+app.delete("/api/superadmin/events/:eventId", checkSuperadmin, async (req, res) => {
   try {
     const result = await Event.deleteOne({ event_id: req.params.eventId });
     if (result.deletedCount === 0) return res.status(404).json({ ok: false, error: "Event not found" });
