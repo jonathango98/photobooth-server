@@ -32,6 +32,7 @@ const eventSchema = new mongoose.Schema({
   },
   gestureTrigger: {
     enabled: { type: Boolean, default: false },
+    gestureType: { type: String, default: "peace" },
     holdDuration: { type: Number, default: 1000 },
     detectionFps: { type: Number, default: 10 },
   },

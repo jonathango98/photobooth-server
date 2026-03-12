@@ -838,7 +838,7 @@ app.post("/api/superadmin/move", checkSuperadmin, async (req, res) => {
       ],
       capture: { totalShots: 3, photoWidth: 880, photoHeight: 495 },
       countdown: { seconds: 3, stepMs: 500 },
-      gestureTrigger: { enabled: false, holdDuration: 1000, detectionFps: 10 },
+      gestureTrigger: { enabled: false, gestureType: "peace", holdDuration: 1000, detectionFps: 10 },
       qr: { size: 300, margin: 1 },
       is_active: true,
     });
