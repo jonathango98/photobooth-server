@@ -93,6 +93,7 @@ app.get("/api/event", async (_req, res) => {
     const event = await Event.findOne({ is_active: true });
     res.json({ eventId: event ? event.event_id : "test" });
   } catch (err) {
+    console.error("Error in GET /api/event:", err);
     res.status(500).json({ ok: false, error: err.message });
   }
 });
@@ -119,6 +120,7 @@ app.get("/api/superadmin/events", checkSuperadmin, async (_req, res) => {
     const events = await Event.find().sort({ created_at: -1 });
     res.json({ ok: true, events });
   } catch (err) {
+    console.error("Error in GET /api/superadmin/events:", err);
     res.status(500).json({ ok: false, error: err.message });
   }
 });
@@ -130,6 +132,7 @@ app.post("/api/superadmin/events", checkSuperadmin, async (req, res) => {
     const event = await Event.create(req.body);
     res.json({ ok: true, event });
   } catch (err) {
+    console.error("Error in POST /api/superadmin/events:", err);
     res.status(500).json({ ok: false, error: err.message });
   }
 });
@@ -147,6 +150,7 @@ app.put("/api/superadmin/events/:eventId", checkSuperadmin, async (req, res) => 
     if (!event) return res.status(404).json({ ok: false, error: "Event not found" });
     res.json({ ok: true, event });
   } catch (err) {
+    console.error("Error in PUT /api/superadmin/events/:eventId:", err);
     res.status(500).json({ ok: false, error: err.message });
   }
 });
@@ -162,6 +166,7 @@ app.post("/api/superadmin/events/:eventId/activate", checkSuperadmin, async (req
     if (!event) return res.status(404).json({ ok: false, error: "Event not found" });
     res.json({ ok: true, event_id: event.event_id });
   } catch (err) {
+    console.error("Error in POST /api/superadmin/events/:eventId/activate:", err);
     res.status(500).json({ ok: false, error: err.message });
   }
 });
@@ -172,6 +177,7 @@ app.delete("/api/superadmin/events/:eventId", checkSuperadmin, async (req, res) 
     if (result.deletedCount === 0) return res.status(404).json({ ok: false, error: "Event not found" });
     res.json({ ok: true });
   } catch (err) {
+    console.error("Error in DELETE /api/superadmin/events/:eventId:", err);
     res.status(500).json({ ok: false, error: err.message });
   }
 });
@@ -642,6 +648,14 @@ app.post("/api/superadmin/move", checkSuperadmin, async (req, res) => {
     console.error("Error in /api/superadmin/move:", err);
     res.status(500).json({ ok: false, error: err.message });
   }
+});
+
+// --------------------------
+// Global error handler
+// --------------------------
+app.use((err, req, res, _next) => {
+  console.error(`Unhandled error on ${req.method} ${req.path}:`, err);
+  res.status(500).json({ ok: false, error: err.message });
 });
 
 // --------------------------
