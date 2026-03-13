@@ -13,6 +13,7 @@ import {
 } from "@aws-sdk/client-s3";
 import { getSignedUrl } from "@aws-sdk/s3-request-presigner";
 import archiver from "archiver";
+import QRCode from "qrcode";
 import "dotenv/config";
 import { connectDB } from "./db.js";
 import Event from "./models/Event.js";
@@ -265,13 +266,17 @@ app.post("/api/save", cpUpload, async (req, res) => {
     // 3) Generate presigned URL for collage (for QR code, valid 7 days)
     const collageUrl = await presignedUrl(collageKey);
 
+    // 4) Generate QR code from collage URL
+    const qrCodeDataUrl = await QRCode.toDataURL(collageUrl);
+
     console.log("Uploaded collage:", collageKey);
 
-    // 4) Respond JSON
+    // 5) Respond JSON
     res.json({
       ok: true,
       sessionId,
       collageUrl,
+      qrCode: qrCodeDataUrl,
     });
   } catch (err) {
     console.error("Error in /api/save:", err);
@@ -649,11 +654,9 @@ app.post("/api/superadmin/move", checkSuperadmin, async (req, res) => {
   if (!anyEvent) {
     await Event.create({
       event_id: "test",
-      event_name: "IFGF NextGen Photo Booth",
+      event_name: "test server",
       templates: [
-        { name: "Template 1", file: "templates/template-1.png", preview: "templates/template-1.png", width: 1080, height: 1920, slots: [{ x: 100, y: 100 }, { x: 100, y: 639 }, { x: 100, y: 1178 }] },
-        { name: "Template 2", file: "templates/template-2.png", preview: "templates/template-2.png", width: 1080, height: 1920, slots: [{ x: 100, y: 100 }, { x: 100, y: 639 }, { x: 100, y: 1178 }] },
-        { name: "Template 3", file: "templates/template-3.png", preview: "templates/template-3.png", width: 1080, height: 1920, slots: [{ x: 100, y: 100 }, { x: 100, y: 639 }, { x: 100, y: 1178 }] },
+        { file: "templates/test/blank.png", width: 1080, height: 1920, slots: [{ x: 100, y: 100 }, { x: 100, y: 639 }, { x: 100, y: 1178 }] },
       ],
       capture: { totalShots: 3, photoWidth: 880, photoHeight: 495 },
       countdown: { seconds: 3, stepMs: 500 },
