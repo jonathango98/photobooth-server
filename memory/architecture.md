@@ -29,6 +29,7 @@ package.json    — Dependencies and scripts
 - `/api/save` — Public: upload raw photos + collage
 - `/api/event` — Public: get active event ID
 - `/api/event/config` — Public: get active event full config
+- `/api/public/photos` — Public: list collage presigned URLs for active event (no auth; for slideshow display)
 - `/api/admin/*` — Admin-protected: view/download photos for active event
 - `/api/superadmin/*` — Superadmin-protected: full CRUD on events, S3 file management
 - `/health` — Health check

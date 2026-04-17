@@ -322,6 +322,34 @@ app.get("/api/admin/photos", checkAdmin, async (_req, res) => {
 });
 
 // --------------------------
+// /api/public/photos endpoint (list collage URLs for active event, no auth)
+// --------------------------
+app.get("/api/public/photos", async (_req, res) => {
+  try {
+    const activeEvent = await Event.findOne({ is_active: true });
+    const eventId = activeEvent ? activeEvent.event_id : "test";
+    const response = await s3.send(
+      new ListObjectsV2Command({
+        Bucket: BUCKET_NAME,
+        Prefix: `${eventId}/collage/`,
+        MaxKeys: 1000,
+      })
+    );
+    const photos = await Promise.all(
+      (response.Contents || []).map(async (obj) => ({
+        id: obj.Key,
+        url: await presignedUrl(obj.Key),
+        uploadedAt: obj.LastModified,
+      }))
+    );
+    res.json({ ok: true, eventId, total: photos.length, photos });
+  } catch (err) {
+    console.error("Error fetching public photos:", err);
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
+// --------------------------
 // /api/admin/download-zip endpoint (download all photos as zip)
 // --------------------------
 app.get("/api/admin/download-zip", checkAdmin, async (_req, res) => {
