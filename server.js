@@ -1,6 +1,7 @@
 import express from "express";
 import path from "path";
 import multer from "multer";
+import https from "https";
 import { fileURLToPath } from "url";
 import {
   S3Client,
@@ -11,6 +12,7 @@ import {
   DeleteObjectsCommand,
   CopyObjectCommand,
 } from "@aws-sdk/client-s3";
+import { NodeHttpHandler } from "@smithy/node-http-handler";
 import { getSignedUrl } from "@aws-sdk/s3-request-presigner";
 import archiver from "archiver";
 import QRCode from "qrcode";
@@ -29,6 +31,9 @@ const s3 = new S3Client({
     secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY,
   },
   forcePathStyle: true,
+  requestHandler: new NodeHttpHandler({
+    httpsAgent: new https.Agent({ maxSockets: 500, keepAlive: true }),
+  }),
 });
 
 const BUCKET_NAME = process.env.BUCKET_NAME;
@@ -223,6 +228,15 @@ async function presignedUrl(key) {
   });
 }
 
+// Helper: run async mapper with bounded concurrency to avoid socket exhaustion
+async function batchMap(items, fn, concurrency = 20) {
+  const results = [];
+  for (let i = 0; i < items.length; i += concurrency) {
+    results.push(...await Promise.all(items.slice(i, i + concurrency).map(fn)));
+  }
+  return results;
+}
+
 // --------------------------
 // /api/save endpoint
 // --------------------------
@@ -301,8 +315,9 @@ app.get("/api/admin/photos", checkAdmin, async (_req, res) => {
       new ListObjectsV2Command({ Bucket: BUCKET_NAME, Prefix: `${eventId}/`, MaxKeys: 500 })
     );
 
-    const photos = await Promise.all(
-      (response.Contents || []).map(async (obj) => {
+    const photos = await batchMap(
+      response.Contents || [],
+      async (obj) => {
         const url = await presignedUrl(obj.Key);
         const parts = obj.Key.split("/");
         return {
@@ -311,7 +326,7 @@ app.get("/api/admin/photos", checkAdmin, async (_req, res) => {
           uploadedAt: obj.LastModified,
           folder: parts.length > 2 ? parts[1] : "root",
         };
-      })
+      }
     );
 
     res.json({ ok: true, photos, total: photos.length });
@@ -335,12 +350,13 @@ app.get("/api/public/photos", async (_req, res) => {
         MaxKeys: 1000,
       })
     );
-    const photos = await Promise.all(
-      (response.Contents || []).map(async (obj) => ({
+    const photos = await batchMap(
+      response.Contents || [],
+      async (obj) => ({
         id: obj.Key,
         url: await presignedUrl(obj.Key),
         uploadedAt: obj.LastModified,
-      }))
+      })
     );
     res.json({ ok: true, eventId, total: photos.length, photos });
   } catch (err) {
@@ -497,13 +513,14 @@ app.get("/api/superadmin/photos", checkSuperadmin, async (req, res) => {
       continuationToken = response.NextContinuationToken;
     } while (continuationToken);
 
-    const files = await Promise.all(
-      allObjects.map(async (obj) => ({
+    const files = await batchMap(
+      allObjects,
+      async (obj) => ({
         key: obj.Key,
         url: await presignedUrl(obj.Key),
         size: obj.Size,
         lastModified: obj.LastModified,
-      }))
+      })
     );
 
     res.json({ ok: true, files });
