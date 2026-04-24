@@ -163,9 +163,6 @@ app.post("/api/superadmin/events", checkSuperadmin, async (req, res) => {
 
 app.put("/api/superadmin/events/:eventId", checkSuperadmin, async (req, res) => {
   try {
-    if (req.body.is_active === true) {
-      await Event.updateMany({ event_id: { $ne: req.params.eventId } }, { is_active: false, updated_at: new Date() });
-    }
     const event = await Event.findOneAndUpdate(
       { event_id: req.params.eventId },
       { ...req.body, updated_at: new Date() },
@@ -181,7 +178,6 @@ app.put("/api/superadmin/events/:eventId", checkSuperadmin, async (req, res) => 
 
 app.post("/api/superadmin/events/:eventId/activate", checkSuperadmin, async (req, res) => {
   try {
-    await Event.updateMany({}, { is_active: false, updated_at: new Date() });
     const event = await Event.findOneAndUpdate(
       { event_id: req.params.eventId },
       { is_active: true, updated_at: new Date() },
@@ -726,6 +722,24 @@ app.post("/api/superadmin/move", checkSuperadmin, async (req, res) => {
     res.json({ ok: true, moved: { from: sourceKey, to: destKey } });
   } catch (err) {
     console.error("Error in /api/superadmin/move:", err);
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
+// --------------------------
+// /api/superadmin/upload-wallpaper endpoint
+// --------------------------
+app.post("/api/superadmin/upload-wallpaper", checkSuperadmin, upload.single("wallpaper"), async (req, res) => {
+  try {
+    if (!req.file) return res.status(400).json({ ok: false, error: "No file uploaded" });
+    const ext = extFromMime(req.file.mimetype);
+    const name = `wallpaper_${Date.now()}${ext}`;
+    const key = `wallpapers/${name}`;
+    await uploadToS3(req.file.buffer, key, req.file.mimetype);
+    const url = await presignedUrl(key);
+    res.json({ ok: true, key, url });
+  } catch (err) {
+    console.error("Error in /api/superadmin/upload-wallpaper:", err);
     res.status(500).json({ ok: false, error: err.message });
   }
 });
