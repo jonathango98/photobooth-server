@@ -100,7 +100,8 @@ app.get("/health", (_req, res) => {
 app.get("/api/event", async (_req, res) => {
   try {
     const event = await Event.findOne({ is_active: true });
-    res.json({ eventId: event ? event.event_id : "test" });
+    if (!event) return res.status(404).json({ ok: false, error: "No active event" });
+    res.json({ eventId: event.event_id });
   } catch (err) {
     console.error("Error in GET /api/event:", err);
     res.status(500).json({ ok: false, error: err.message });
@@ -112,7 +113,7 @@ app.get("/api/event", async (_req, res) => {
 // --------------------------
 app.get("/api/event/config", async (_req, res) => {
   try {
-    const event = await Event.findOne({ is_active: true }) ?? await Event.findOne({ event_id: "test" });
+    const event = await Event.findOne({ is_active: true });
     if (!event) return res.status(404).json({ ok: false, error: "No active event found" });
     res.json(event);
   } catch (err) {
@@ -271,7 +272,8 @@ app.post("/api/save", cpUpload, async (req, res) => {
     let eventId = req.body.eventId?.trim();
     if (!eventId) {
       const activeEvent = await Event.findOne({ is_active: true });
-      eventId = activeEvent ? activeEvent.event_id : "test";
+      if (!activeEvent) return res.status(404).json({ ok: false, error: "No active event" });
+      eventId = activeEvent.event_id;
     }
     const sessionId = Date.now().toString();
 
@@ -333,7 +335,8 @@ app.get("/api/admin/photos", checkAdmin, async (req, res) => {
     let eventId = req.query.eventId?.trim();
     if (!eventId) {
       const activeEvent = await Event.findOne({ is_active: true });
-      eventId = activeEvent ? activeEvent.event_id : "test";
+      if (!activeEvent) return res.status(404).json({ ok: false, error: "No active event" });
+      eventId = activeEvent.event_id;
     }
     const response = await s3.send(
       new ListObjectsV2Command({ Bucket: BUCKET_NAME, Prefix: `${eventId}/`, MaxKeys: 500 })
@@ -368,7 +371,8 @@ app.get("/api/public/photos", async (req, res) => {
     let eventId = req.query.eventId?.trim();
     if (!eventId) {
       const activeEvent = await Event.findOne({ is_active: true });
-      eventId = activeEvent ? activeEvent.event_id : "test";
+      if (!activeEvent) return res.status(404).json({ ok: false, error: "No active event" });
+      eventId = activeEvent.event_id;
     }
     const response = await s3.send(
       new ListObjectsV2Command({
@@ -400,7 +404,8 @@ app.get("/api/admin/download-zip", checkAdmin, async (req, res) => {
     let eventId = req.query.eventId?.trim();
     if (!eventId) {
       const activeEvent = await Event.findOne({ is_active: true });
-      eventId = activeEvent ? activeEvent.event_id : "test";
+      if (!activeEvent) return res.status(404).json({ ok: false, error: "No active event" });
+      eventId = activeEvent.event_id;
     }
     const response = await s3.send(
       new ListObjectsV2Command({ Bucket: BUCKET_NAME, Prefix: `${eventId}/`, MaxKeys: 500 })
