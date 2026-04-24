@@ -128,7 +128,7 @@ app.get("/api/event/config", async (_req, res) => {
 app.get("/api/event/:eventId/config", async (req, res) => {
   try {
     const event = await Event.findOne({ event_id: req.params.eventId });
-    if (!event) return res.status(404).json({ ok: false, error: "Event not found" });
+    if (!event || !event.is_active) return res.status(404).json({ ok: false, error: "Event not found" });
     res.json(event);
   } catch (err) {
     console.error("Error fetching event config by ID:", err);
