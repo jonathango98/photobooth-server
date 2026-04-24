@@ -41,6 +41,7 @@ const eventSchema = new mongoose.Schema({
     margin: Number,
   },
   background_url: { type: String, default: "" },
+  admin_password: { type: String, default: "" },
   is_active: { type: Boolean, default: true },
   created_at: { type: Date, default: Date.now },
   updated_at: { type: Date, default: Date.now },

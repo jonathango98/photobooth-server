@@ -65,13 +65,17 @@ app.use(express.json());
 // --------------------------
 // Admin auth middleware
 // --------------------------
-const checkAdmin = (req, res, next) => {
+const checkAdmin = async (req, res, next) => {
   const password = req.headers["x-admin-password"];
-  if (password === process.env.ADMIN_PASSWORD) {
-    next();
-  } else {
-    res.status(401).json({ error: "Unauthorized" });
+  if (!password) return res.status(401).json({ error: "Unauthorized" });
+  if (password === process.env.ADMIN_PASSWORD) return next();
+  // Check per-event password
+  const eventId = req.query.eventId?.trim() || req.body?.eventId?.trim();
+  if (eventId) {
+    const event = await Event.findOne({ event_id: eventId }).select("admin_password");
+    if (event?.admin_password && password === event.admin_password) return next();
   }
+  res.status(401).json({ error: "Unauthorized" });
 };
 
 const checkSuperadmin = (req, res, next) => {
