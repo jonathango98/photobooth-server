@@ -118,6 +118,20 @@ app.get("/api/event/config", async (_req, res) => {
 });
 
 // --------------------------
+// /api/event/:eventId/config endpoint (no auth required, fetch any event by ID)
+// --------------------------
+app.get("/api/event/:eventId/config", async (req, res) => {
+  try {
+    const event = await Event.findOne({ event_id: req.params.eventId });
+    if (!event) return res.status(404).json({ ok: false, error: "Event not found" });
+    res.json(event);
+  } catch (err) {
+    console.error("Error fetching event config by ID:", err);
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
+// --------------------------
 // /api/superadmin/events CRUD endpoints
 // --------------------------
 app.get("/api/superadmin/events", checkSuperadmin, async (_req, res) => {
@@ -250,8 +264,11 @@ app.post("/api/save", cpUpload, async (req, res) => {
   try {
     const files = req.files || {};
 
-    const activeEvent = await Event.findOne({ is_active: true });
-    const eventId = activeEvent ? activeEvent.event_id : "test";
+    let eventId = req.body.eventId?.trim();
+    if (!eventId) {
+      const activeEvent = await Event.findOne({ is_active: true });
+      eventId = activeEvent ? activeEvent.event_id : "test";
+    }
     const sessionId = Date.now().toString();
 
     // 1) Upload raw photos
@@ -307,10 +324,13 @@ app.post("/api/save", cpUpload, async (req, res) => {
 // --------------------------
 // /api/admin/photos endpoint (list all photos)
 // --------------------------
-app.get("/api/admin/photos", checkAdmin, async (_req, res) => {
+app.get("/api/admin/photos", checkAdmin, async (req, res) => {
   try {
-    const activeEvent = await Event.findOne({ is_active: true });
-    const eventId = activeEvent ? activeEvent.event_id : "test";
+    let eventId = req.query.eventId?.trim();
+    if (!eventId) {
+      const activeEvent = await Event.findOne({ is_active: true });
+      eventId = activeEvent ? activeEvent.event_id : "test";
+    }
     const response = await s3.send(
       new ListObjectsV2Command({ Bucket: BUCKET_NAME, Prefix: `${eventId}/`, MaxKeys: 500 })
     );
@@ -337,12 +357,15 @@ app.get("/api/admin/photos", checkAdmin, async (_req, res) => {
 });
 
 // --------------------------
-// /api/public/photos endpoint (list collage URLs for active event, no auth)
+// /api/public/photos endpoint (list collage URLs, no auth)
 // --------------------------
-app.get("/api/public/photos", async (_req, res) => {
+app.get("/api/public/photos", async (req, res) => {
   try {
-    const activeEvent = await Event.findOne({ is_active: true });
-    const eventId = activeEvent ? activeEvent.event_id : "test";
+    let eventId = req.query.eventId?.trim();
+    if (!eventId) {
+      const activeEvent = await Event.findOne({ is_active: true });
+      eventId = activeEvent ? activeEvent.event_id : "test";
+    }
     const response = await s3.send(
       new ListObjectsV2Command({
         Bucket: BUCKET_NAME,
@@ -368,10 +391,13 @@ app.get("/api/public/photos", async (_req, res) => {
 // --------------------------
 // /api/admin/download-zip endpoint (download all photos as zip)
 // --------------------------
-app.get("/api/admin/download-zip", checkAdmin, async (_req, res) => {
+app.get("/api/admin/download-zip", checkAdmin, async (req, res) => {
   try {
-    const activeEvent = await Event.findOne({ is_active: true });
-    const eventId = activeEvent ? activeEvent.event_id : "test";
+    let eventId = req.query.eventId?.trim();
+    if (!eventId) {
+      const activeEvent = await Event.findOne({ is_active: true });
+      eventId = activeEvent ? activeEvent.event_id : "test";
+    }
     const response = await s3.send(
       new ListObjectsV2Command({ Bucket: BUCKET_NAME, Prefix: `${eventId}/`, MaxKeys: 500 })
     );
