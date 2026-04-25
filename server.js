@@ -384,8 +384,11 @@ app.get("/api/session/:sessionId/status", async (req, res) => {
         await s3.send(new HeadObjectCommand({ Bucket: BUCKET_NAME, Key: key }));
         const url = await presignedUrl(key);
         return res.json({ ready: true, url });
-      } catch {
-        // not found, try next ext
+      } catch (e) {
+        const code = e.$metadata?.httpStatusCode ?? e.name;
+        if (code !== 404 && code !== "NoSuchKey" && code !== "NotFound") {
+          console.warn(`[status] HeadObject ${key}: ${code} ${e.message}`);
+        }
       }
     }
     res.json({ ready: false });
@@ -403,7 +406,6 @@ app.get("/p/:sessionId", (req, res) => {
   if (!/^[A-Za-z0-9_-]{1,64}$/.test(sessionId)) {
     return res.status(400).send("Invalid session ID");
   }
-  const origin = `${req.protocol}://${req.get("host")}`;
   res.setHeader("Content-Type", "text/html; charset=utf-8");
   res.send(`<!DOCTYPE html>
 <html lang="en">
@@ -430,9 +432,8 @@ app.get("/p/:sessionId", (req, res) => {
 <script>
 (function(){
   var sessionId = ${JSON.stringify(sessionId)};
-  var origin    = ${JSON.stringify(origin)};
   function check(){
-    fetch(origin+'/api/session/'+sessionId+'/status')
+    fetch('/api/session/'+sessionId+'/status')
       .then(function(r){return r.json()})
       .then(function(d){
         if(d.ready){
