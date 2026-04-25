@@ -8,6 +8,7 @@ import {
   PutObjectCommand,
   ListObjectsV2Command,
   GetObjectCommand,
+  HeadObjectCommand,
   DeleteObjectCommand,
   DeleteObjectsCommand,
   CopyObjectCommand,
@@ -271,7 +272,10 @@ app.post("/api/save", cpUpload, async (req, res) => {
       if (!activeEvent) return res.status(404).json({ ok: false, error: "No active event" });
       eventId = activeEvent.event_id;
     }
-    const sessionId = Date.now().toString();
+    const rawClientId = req.body.sessionId?.trim() ?? "";
+    const sessionId = /^[A-Za-z0-9_-]{1,64}$/.test(rawClientId)
+      ? rawClientId
+      : Date.now().toString();
 
     // 1) Upload raw photos
     const uploadPromises = [];
@@ -295,7 +299,7 @@ app.post("/api/save", cpUpload, async (req, res) => {
 
     const collageFile = collageArr[0];
     const collageExt = extFromMime(collageFile.mimetype);
-    const collageKey = `${eventId}/collage/session_${sessionId}_collage${collageExt}`;
+    const collageKey = `${eventId}/collage/${sessionId}${collageExt}`;
 
     await Promise.all([
       uploadToS3(collageFile.buffer, collageKey, collageFile.mimetype),
@@ -357,6 +361,94 @@ app.get("/api/admin/photos", checkAdmin, async (req, res) => {
     console.error("Error fetching photos:", err);
     res.status(500).json({ ok: false, error: err.message });
   }
+});
+
+// --------------------------
+// /api/session/:sessionId/status  (no auth — public)
+// --------------------------
+app.get("/api/session/:sessionId/status", async (req, res) => {
+  const { sessionId } = req.params;
+  if (!/^[A-Za-z0-9_-]{1,64}$/.test(sessionId)) {
+    return res.status(400).json({ ok: false, error: "Invalid sessionId" });
+  }
+  try {
+    // Find the active event to build the key prefix
+    const activeEvent = await Event.findOne({ is_active: true });
+    if (!activeEvent) return res.json({ ready: false });
+
+    const eventId = activeEvent.event_id;
+    // Try .jpg first (most common), then .png
+    for (const ext of [".jpg", ".png", ".webp"]) {
+      const key = `${eventId}/collage/${sessionId}${ext}`;
+      try {
+        await s3.send(new HeadObjectCommand({ Bucket: BUCKET_NAME, Key: key }));
+        const url = await presignedUrl(key);
+        return res.json({ ready: true, url });
+      } catch {
+        // not found, try next ext
+      }
+    }
+    res.json({ ready: false });
+  } catch (err) {
+    console.error("Error in /api/session/:sessionId/status:", err);
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
+// --------------------------
+// /p/:sessionId  — guest landing page
+// --------------------------
+app.get("/p/:sessionId", (req, res) => {
+  const { sessionId } = req.params;
+  if (!/^[A-Za-z0-9_-]{1,64}$/.test(sessionId)) {
+    return res.status(400).send("Invalid session ID");
+  }
+  const origin = `${req.protocol}://${req.get("host")}`;
+  res.setHeader("Content-Type", "text/html; charset=utf-8");
+  res.send(`<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Your Photo</title>
+<style>
+  *{box-sizing:border-box;margin:0;padding:0}
+  body{font-family:system-ui,sans-serif;background:#111;color:#f0ead8;display:flex;align-items:center;justify-content:center;min-height:100vh;padding:16px}
+  .card{text-align:center;max-width:480px;width:100%}
+  img{max-width:100%;border-radius:8px;margin-bottom:16px}
+  p{font-size:14px;opacity:.7;margin-bottom:12px}
+  a.btn{display:inline-block;padding:10px 24px;background:#c8703a;color:#fff;border-radius:6px;text-decoration:none;font-size:14px}
+  .spin{font-size:32px;animation:spin 1s linear infinite;display:inline-block;margin-bottom:12px}
+  @keyframes spin{to{transform:rotate(360deg)}}
+</style>
+</head>
+<body>
+<div class="card" id="app">
+  <div class="spin">⏳</div>
+  <p id="msg">Your photo is on its way…</p>
+</div>
+<script>
+(function(){
+  var sessionId = ${JSON.stringify(sessionId)};
+  var origin    = ${JSON.stringify(origin)};
+  function check(){
+    fetch(origin+'/api/session/'+sessionId+'/status')
+      .then(function(r){return r.json()})
+      .then(function(d){
+        if(d.ready){
+          var app=document.getElementById('app');
+          app.innerHTML='<img src="'+d.url+'" alt="Your photo"><br><a class="btn" href="'+d.url+'" download="photo.jpg">Download</a>';
+        } else {
+          setTimeout(check,5000);
+        }
+      })
+      .catch(function(){setTimeout(check,5000)});
+  }
+  check();
+})();
+</script>
+</body>
+</html>`);
 });
 
 // --------------------------
