@@ -373,7 +373,10 @@ app.get("/api/session/:sessionId/status", async (req, res) => {
   try {
     // Find the active event to build the key prefix
     const activeEvent = await Event.findOne({ is_active: true });
-    if (!activeEvent) return res.json({ ready: false });
+    if (!activeEvent) {
+      console.log(`[status] no active event for sessionId=${sessionId}`);
+      return res.json({ ready: false });
+    }
 
     const eventId = activeEvent.event_id;
     const prefix = `${eventId}/collage/${sessionId}`;
@@ -383,6 +386,7 @@ app.get("/api/session/:sessionId/status", async (req, res) => {
       MaxKeys: 1,
     }));
     const match = listRes.Contents?.[0];
+    console.log(`[status] prefix=${prefix} found=${match?.Key ?? "none"}`);
     if (match) {
       const url = await presignedUrl(match.Key);
       return res.json({ ready: true, url });
