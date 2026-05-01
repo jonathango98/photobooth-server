@@ -372,15 +372,7 @@ app.get("/api/session/:sessionId/status", async (req, res) => {
   }
   try {
     let eventId = req.query.eventId?.trim();
-    if (eventId && /^[A-Za-z0-9_-]{1,64}$/.test(eventId)) {
-      // Verify the event exists
-      const event = await Event.findOne({ event_id: eventId });
-      if (!event) eventId = null;
-    } else {
-      eventId = null;
-    }
-
-    if (!eventId) {
+    if (!eventId || !/^[A-Za-z0-9_.-]{1,64}$/.test(eventId)) {
       // Fall back to the active event
       const activeEvent = await Event.findOne({ is_active: true });
       if (!activeEvent) {
@@ -417,7 +409,7 @@ app.get("/p/:sessionId", (req, res) => {
     return res.status(400).send("Invalid session ID");
   }
   const rawEventId = req.query.eventId?.trim() ?? "";
-  const eventId = /^[A-Za-z0-9_-]{1,64}$/.test(rawEventId) ? rawEventId : "";
+  const eventId = /^[A-Za-z0-9_.-]{1,64}$/.test(rawEventId) ? rawEventId : "";
   res.setHeader("Content-Type", "text/html; charset=utf-8");
   res.send(`<!DOCTYPE html>
 <html lang="en">
@@ -450,9 +442,23 @@ app.get("/p/:sessionId", (req, res) => {
     fetch(url)
       .then(function(r){return r.json()})
       .then(function(d){
-        if(d.ready){
+        if(d.ready && d.url){
           var app=document.getElementById('app');
-          app.innerHTML='<img src="'+d.url+'" alt="Your photo"><br><a class="btn" href="'+d.url+'" download="photo.jpg">Download</a>';
+          var img=document.createElement('img');
+          img.alt='Your photo';
+          img.src=d.url;
+          img.onerror=function(){
+            app.innerHTML='<p>Photo ready but failed to load. <a href="'+d.url+'">Try opening directly</a>.</p>';
+          };
+          var btn=document.createElement('a');
+          btn.className='btn';
+          btn.href=d.url;
+          btn.download='photo.jpg';
+          btn.textContent='Download';
+          app.innerHTML='';
+          app.appendChild(img);
+          app.appendChild(document.createElement('br'));
+          app.appendChild(btn);
         } else {
           setTimeout(check,5000);
         }
