@@ -8,7 +8,6 @@ import {
   PutObjectCommand,
   ListObjectsV2Command,
   GetObjectCommand,
-  HeadObjectCommand,
   DeleteObjectCommand,
   DeleteObjectsCommand,
   CopyObjectCommand,
@@ -377,19 +376,16 @@ app.get("/api/session/:sessionId/status", async (req, res) => {
     if (!activeEvent) return res.json({ ready: false });
 
     const eventId = activeEvent.event_id;
-    // Try .jpg first (most common), then .png
-    for (const ext of [".jpg", ".png", ".webp"]) {
-      const key = `${eventId}/collage/${sessionId}${ext}`;
-      try {
-        await s3.send(new HeadObjectCommand({ Bucket: BUCKET_NAME, Key: key }));
-        const url = await presignedUrl(key);
-        return res.json({ ready: true, url });
-      } catch (e) {
-        const code = e.$metadata?.httpStatusCode ?? e.name;
-        if (code !== 404 && code !== "NoSuchKey" && code !== "NotFound") {
-          console.warn(`[status] HeadObject ${key}: ${code} ${e.message}`);
-        }
-      }
+    const prefix = `${eventId}/collage/${sessionId}`;
+    const listRes = await s3.send(new ListObjectsV2Command({
+      Bucket: BUCKET_NAME,
+      Prefix: prefix,
+      MaxKeys: 1,
+    }));
+    const match = listRes.Contents?.[0];
+    if (match) {
+      const url = await presignedUrl(match.Key);
+      return res.json({ ready: true, url });
     }
     res.json({ ready: false });
   } catch (err) {
