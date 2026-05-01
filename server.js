@@ -371,14 +371,24 @@ app.get("/api/session/:sessionId/status", async (req, res) => {
     return res.status(400).json({ ok: false, error: "Invalid sessionId" });
   }
   try {
-    // Find the active event to build the key prefix
-    const activeEvent = await Event.findOne({ is_active: true });
-    if (!activeEvent) {
-      console.log(`[status] no active event for sessionId=${sessionId}`);
-      return res.json({ ready: false });
+    let eventId = req.query.eventId?.trim();
+    if (eventId && /^[A-Za-z0-9_-]{1,64}$/.test(eventId)) {
+      // Verify the event exists
+      const event = await Event.findOne({ event_id: eventId });
+      if (!event) eventId = null;
+    } else {
+      eventId = null;
     }
 
-    const eventId = activeEvent.event_id;
+    if (!eventId) {
+      // Fall back to the active event
+      const activeEvent = await Event.findOne({ is_active: true });
+      if (!activeEvent) {
+        console.log(`[status] no active event for sessionId=${sessionId}`);
+        return res.json({ ready: false });
+      }
+      eventId = activeEvent.event_id;
+    }
     const prefix = `${eventId}/collage/${sessionId}`;
     const listRes = await s3.send(new ListObjectsV2Command({
       Bucket: BUCKET_NAME,
@@ -406,6 +416,8 @@ app.get("/p/:sessionId", (req, res) => {
   if (!/^[A-Za-z0-9_-]{1,64}$/.test(sessionId)) {
     return res.status(400).send("Invalid session ID");
   }
+  const rawEventId = req.query.eventId?.trim() ?? "";
+  const eventId = /^[A-Za-z0-9_-]{1,64}$/.test(rawEventId) ? rawEventId : "";
   res.setHeader("Content-Type", "text/html; charset=utf-8");
   res.send(`<!DOCTYPE html>
 <html lang="en">
@@ -432,8 +444,10 @@ app.get("/p/:sessionId", (req, res) => {
 <script>
 (function(){
   var sessionId = ${JSON.stringify(sessionId)};
+  var eventId = ${JSON.stringify(eventId)};
   function check(){
-    fetch('/api/session/'+sessionId+'/status')
+    var url = '/api/session/'+sessionId+'/status'+(eventId ? '?eventId='+encodeURIComponent(eventId) : '');
+    fetch(url)
       .then(function(r){return r.json()})
       .then(function(d){
         if(d.ready){
