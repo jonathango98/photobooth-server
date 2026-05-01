@@ -371,28 +371,30 @@ app.get("/api/session/:sessionId/status", async (req, res) => {
     return res.status(400).json({ ok: false, error: "Invalid sessionId" });
   }
   try {
-    let eventId = req.query.eventId?.trim();
-    if (!eventId || !/^[A-Za-z0-9_.-]{1,64}$/.test(eventId)) {
-      // Fall back to the active event
-      const activeEvent = await Event.findOne({ is_active: true });
-      if (!activeEvent) {
-        console.log(`[status] no active event for sessionId=${sessionId}`);
-        return res.json({ ready: false });
+    // Build ordered list of event IDs to check: hinted one first, then all others
+    const hintedId = req.query.eventId?.trim();
+    const allEvents = await Event.find().select("event_id").lean();
+    const allIds = allEvents.map(e => e.event_id);
+
+    const checkOrder = hintedId && /^[A-Za-z0-9_.-]{1,64}$/.test(hintedId)
+      ? [hintedId, ...allIds.filter(id => id !== hintedId)]
+      : allIds;
+
+    for (const eventId of checkOrder) {
+      const prefix = `${eventId}/collage/${sessionId}`;
+      const listRes = await s3.send(new ListObjectsV2Command({
+        Bucket: BUCKET_NAME,
+        Prefix: prefix,
+        MaxKeys: 1,
+      }));
+      const match = listRes.Contents?.[0];
+      console.log(`[status] prefix=${prefix} found=${match?.Key ?? "none"}`);
+      if (match) {
+        const url = await presignedUrl(match.Key);
+        return res.json({ ready: true, url });
       }
-      eventId = activeEvent.event_id;
     }
-    const prefix = `${eventId}/collage/${sessionId}`;
-    const listRes = await s3.send(new ListObjectsV2Command({
-      Bucket: BUCKET_NAME,
-      Prefix: prefix,
-      MaxKeys: 1,
-    }));
-    const match = listRes.Contents?.[0];
-    console.log(`[status] prefix=${prefix} found=${match?.Key ?? "none"}`);
-    if (match) {
-      const url = await presignedUrl(match.Key);
-      return res.json({ ready: true, url });
-    }
+
     res.json({ ready: false });
   } catch (err) {
     console.error("Error in /api/session/:sessionId/status:", err);
