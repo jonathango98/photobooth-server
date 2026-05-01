@@ -19,6 +19,7 @@ import QRCode from "qrcode";
 import "dotenv/config";
 import { connectDB } from "./db.js";
 import Event from "./models/Event.js";
+import { logger, requestLogger } from "./logger.js";
 
 // --------------------------
 // Railway Bucket (S3-compatible) configuration
@@ -61,13 +62,17 @@ app.use((req, res, next) => {
 });
 
 app.use(express.json());
+app.use(requestLogger);
 
 // --------------------------
 // Admin auth middleware
 // --------------------------
 const checkAdmin = async (req, res, next) => {
   const password = req.headers["x-admin-password"];
-  if (!password) return res.status(401).json({ error: "Unauthorized" });
+  if (!password) {
+    req.log.warn("Admin auth rejected: no password header");
+    return res.status(401).json({ error: "Unauthorized" });
+  }
   if (password === process.env.ADMIN_PASSWORD) return next();
   // Check per-event password
   const eventId = req.query.eventId?.trim() || req.body?.eventId?.trim();
@@ -75,6 +80,7 @@ const checkAdmin = async (req, res, next) => {
     const event = await Event.findOne({ event_id: eventId }).select("admin_password");
     if (event?.admin_password && password === event.admin_password) return next();
   }
+  req.log.warn("Admin auth rejected: wrong password", { eventId });
   res.status(401).json({ error: "Unauthorized" });
 };
 
@@ -83,6 +89,7 @@ const checkSuperadmin = (req, res, next) => {
   if (password && password === process.env.SUPERADMIN_PASSWORD) {
     next();
   } else {
+    req.log.warn("Superadmin auth rejected");
     res.status(401).json({ error: "Unauthorized" });
   }
 };
@@ -97,13 +104,13 @@ app.get("/health", (_req, res) => {
 // --------------------------
 // /api/event endpoint
 // --------------------------
-app.get("/api/event", async (_req, res) => {
+app.get("/api/event", async (req, res) => {
   try {
     const event = await Event.findOne({ is_active: true });
     if (!event) return res.status(404).json({ ok: false, error: "No active event" });
     res.json({ eventId: event.event_id });
   } catch (err) {
-    console.error("Error in GET /api/event:", err);
+    req.log.error("Failed to get active event", { err });
     res.status(500).json({ ok: false, error: err.message });
   }
 });
@@ -111,13 +118,13 @@ app.get("/api/event", async (_req, res) => {
 // --------------------------
 // /api/event/config endpoint (no auth required)
 // --------------------------
-app.get("/api/event/config", async (_req, res) => {
+app.get("/api/event/config", async (req, res) => {
   try {
     const event = await Event.findOne({ is_active: true });
     if (!event) return res.status(404).json({ ok: false, error: "No active event found" });
     res.json(event);
   } catch (err) {
-    console.error("Error fetching event config:", err);
+    req.log.error("Failed to fetch active event config", { err });
     res.status(500).json({ ok: false, error: err.message });
   }
 });
@@ -131,7 +138,7 @@ app.get("/api/event/:eventId/config", async (req, res) => {
     if (!event || !event.is_active) return res.status(404).json({ ok: false, error: "Event not found" });
     res.json(event);
   } catch (err) {
-    console.error("Error fetching event config by ID:", err);
+    req.log.error("Failed to fetch event config", { eventId: req.params.eventId, err });
     res.status(500).json({ ok: false, error: err.message });
   }
 });
@@ -139,12 +146,13 @@ app.get("/api/event/:eventId/config", async (req, res) => {
 // --------------------------
 // /api/superadmin/events CRUD endpoints
 // --------------------------
-app.get("/api/superadmin/events", checkSuperadmin, async (_req, res) => {
+app.get("/api/superadmin/events", checkSuperadmin, async (req, res) => {
   try {
     const events = await Event.find().sort({ created_at: -1 });
+    req.log.debug("Listed events", { count: events.length });
     res.json({ ok: true, events });
   } catch (err) {
-    console.error("Error in GET /api/superadmin/events:", err);
+    req.log.error("Failed to list events", { err });
     res.status(500).json({ ok: false, error: err.message });
   }
 });
@@ -154,9 +162,10 @@ app.post("/api/superadmin/events", checkSuperadmin, async (req, res) => {
     const existing = await Event.findOne({ event_id: req.body.event_id });
     if (existing) return res.status(409).json({ ok: false, error: "event_id already exists" });
     const event = await Event.create(req.body);
+    req.log.info("Event created", { eventId: event.event_id });
     res.json({ ok: true, event });
   } catch (err) {
-    console.error("Error in POST /api/superadmin/events:", err);
+    req.log.error("Failed to create event", { eventId: req.body.event_id, err });
     res.status(500).json({ ok: false, error: err.message });
   }
 });
@@ -169,9 +178,10 @@ app.put("/api/superadmin/events/:eventId", checkSuperadmin, async (req, res) => 
       { new: true }
     );
     if (!event) return res.status(404).json({ ok: false, error: "Event not found" });
+    req.log.info("Event updated", { eventId: req.params.eventId });
     res.json({ ok: true, event });
   } catch (err) {
-    console.error("Error in PUT /api/superadmin/events/:eventId:", err);
+    req.log.error("Failed to update event", { eventId: req.params.eventId, err });
     res.status(500).json({ ok: false, error: err.message });
   }
 });
@@ -184,9 +194,10 @@ app.post("/api/superadmin/events/:eventId/activate", checkSuperadmin, async (req
       { new: true }
     );
     if (!event) return res.status(404).json({ ok: false, error: "Event not found" });
+    req.log.info("Event activated", { eventId: event.event_id });
     res.json({ ok: true, event_id: event.event_id });
   } catch (err) {
-    console.error("Error in POST /api/superadmin/events/:eventId/activate:", err);
+    req.log.error("Failed to activate event", { eventId: req.params.eventId, err });
     res.status(500).json({ ok: false, error: err.message });
   }
 });
@@ -195,9 +206,10 @@ app.delete("/api/superadmin/events/:eventId", checkSuperadmin, async (req, res) 
   try {
     const result = await Event.deleteOne({ event_id: req.params.eventId });
     if (result.deletedCount === 0) return res.status(404).json({ ok: false, error: "Event not found" });
+    req.log.info("Event deleted", { eventId: req.params.eventId });
     res.json({ ok: true });
   } catch (err) {
-    console.error("Error in DELETE /api/superadmin/events/:eventId:", err);
+    req.log.error("Failed to delete event", { eventId: req.params.eventId, err });
     res.status(500).json({ ok: false, error: err.message });
   }
 });
@@ -276,8 +288,12 @@ app.post("/api/save", cpUpload, async (req, res) => {
       ? rawClientId
       : Date.now().toString();
 
+    const log = req.log.child({ sessionId, eventId });
+    log.info("Save request received");
+
     // 1) Upload raw photos
     const uploadPromises = [];
+    const rawKeys = [];
 
     for (let i = 0; i < MAX_RAW_PHOTOS; i++) {
       const fileArr = files[`raw${i + 1}`];
@@ -286,19 +302,23 @@ app.post("/api/save", cpUpload, async (req, res) => {
       const file = fileArr[0];
       const ext = extFromMime(file.mimetype);
       const key = `${eventId}/raw/session_${sessionId}_raw${i + 1}${ext}`;
+      rawKeys.push(key);
+      log.debug(`Queuing raw photo upload`, { slot: i + 1, key, bytes: file.buffer.length });
       uploadPromises.push(uploadToS3(file.buffer, key, file.mimetype));
     }
 
     // 2) Upload collage
     const collageArr = files["collage"];
     if (!collageArr || collageArr.length === 0) {
-      console.error("No collage file received");
+      log.warn("No collage file in request");
       return res.status(400).send("No collage file received");
     }
 
     const collageFile = collageArr[0];
     const collageExt = extFromMime(collageFile.mimetype);
     const collageKey = `${eventId}/collage/${sessionId}${collageExt}`;
+
+    log.debug("Uploading collage + raw photos", { collageKey, rawCount: rawKeys.length, bytes: collageFile.buffer.length });
 
     await Promise.all([
       uploadToS3(collageFile.buffer, collageKey, collageFile.mimetype),
@@ -311,7 +331,7 @@ app.post("/api/save", cpUpload, async (req, res) => {
     // 4) Generate QR code from collage URL
     const qrCodeDataUrl = await QRCode.toDataURL(collageUrl);
 
-    console.log("Uploaded collage:", collageKey);
+    log.info("Session saved", { collageKey, rawCount: rawKeys.length });
 
     // 5) Respond JSON
     res.json({
@@ -321,7 +341,7 @@ app.post("/api/save", cpUpload, async (req, res) => {
       qrCode: qrCodeDataUrl,
     });
   } catch (err) {
-    console.error("Error in /api/save:", err);
+    req.log.error("Failed to save session", { err });
     res.status(500).send("Server error while saving files");
   }
 });
@@ -337,6 +357,7 @@ app.get("/api/admin/photos", checkAdmin, async (req, res) => {
       if (!activeEvent) return res.status(404).json({ ok: false, error: "No active event" });
       eventId = activeEvent.event_id;
     }
+    req.log.debug("Listing admin photos", { eventId });
     const response = await s3.send(
       new ListObjectsV2Command({ Bucket: BUCKET_NAME, Prefix: `${eventId}/`, MaxKeys: 500 })
     );
@@ -355,9 +376,10 @@ app.get("/api/admin/photos", checkAdmin, async (req, res) => {
       }
     );
 
+    req.log.debug("Admin photos listed", { eventId, total: photos.length });
     res.json({ ok: true, photos, total: photos.length });
   } catch (err) {
-    console.error("Error fetching photos:", err);
+    req.log.error("Failed to list admin photos", { err });
     res.status(500).json({ ok: false, error: err.message });
   }
 });
@@ -368,6 +390,7 @@ app.get("/api/admin/photos", checkAdmin, async (req, res) => {
 app.get("/api/session/:sessionId/status", async (req, res) => {
   const { sessionId } = req.params;
   if (!/^[A-Za-z0-9_-]{1,64}$/.test(sessionId)) {
+    req.log.warn("Status check: invalid sessionId", { sessionId });
     return res.status(400).json({ ok: false, error: "Invalid sessionId" });
   }
   try {
@@ -380,6 +403,8 @@ app.get("/api/session/:sessionId/status", async (req, res) => {
       ? [hintedId, ...allIds.filter(id => id !== hintedId)]
       : allIds;
 
+    req.log.debug("Status check", { sessionId, hintedEventId: hintedId, checking: checkOrder.length });
+
     for (const eventId of checkOrder) {
       const prefix = `${eventId}/collage/${sessionId}`;
       const listRes = await s3.send(new ListObjectsV2Command({
@@ -388,16 +413,17 @@ app.get("/api/session/:sessionId/status", async (req, res) => {
         MaxKeys: 1,
       }));
       const match = listRes.Contents?.[0];
-      console.log(`[status] prefix=${prefix} found=${match?.Key ?? "none"}`);
       if (match) {
+        req.log.info("Session ready", { sessionId, key: match.Key });
         const url = await presignedUrl(match.Key);
         return res.json({ ready: true, url });
       }
     }
 
+    req.log.debug("Session not ready yet", { sessionId });
     res.json({ ready: false });
   } catch (err) {
-    console.error("Error in /api/session/:sessionId/status:", err);
+    req.log.error("Failed to check session status", { sessionId, err });
     res.status(500).json({ ok: false, error: err.message });
   }
 });
@@ -485,6 +511,7 @@ app.get("/api/public/photos", async (req, res) => {
       if (!activeEvent) return res.status(404).json({ ok: false, error: "No active event" });
       eventId = activeEvent.event_id;
     }
+    req.log.debug("Listing public photos", { eventId });
     const response = await s3.send(
       new ListObjectsV2Command({
         Bucket: BUCKET_NAME,
@@ -500,9 +527,10 @@ app.get("/api/public/photos", async (req, res) => {
         uploadedAt: obj.LastModified,
       })
     );
+    req.log.debug("Public photos listed", { eventId, total: photos.length });
     res.json({ ok: true, eventId, total: photos.length, photos });
   } catch (err) {
-    console.error("Error fetching public photos:", err);
+    req.log.error("Failed to list public photos", { err });
     res.status(500).json({ ok: false, error: err.message });
   }
 });
@@ -522,6 +550,9 @@ app.get("/api/admin/download-zip", checkAdmin, async (req, res) => {
       new ListObjectsV2Command({ Bucket: BUCKET_NAME, Prefix: `${eventId}/`, MaxKeys: 500 })
     );
 
+    const fileCount = (response.Contents || []).length;
+    req.log.info("Starting zip download", { eventId, fileCount });
+
     const archive = archiver("zip", { zlib: { level: 9 } });
 
     res.attachment("photos.zip");
@@ -536,8 +567,9 @@ app.get("/api/admin/download-zip", checkAdmin, async (req, res) => {
     }
 
     await archive.finalize();
+    req.log.info("Zip download complete", { eventId, fileCount });
   } catch (err) {
-    console.error("Error creating zip:", err);
+    req.log.error("Failed to create zip", { err });
     res.status(500).json({ ok: false, error: err.message });
   }
 });
@@ -553,11 +585,13 @@ app.post("/api/admin/download-selected", checkAdmin, async (req, res) => {
       return res.status(400).json({ ok: false, error: "Invalid photoIds array" });
     }
 
+    req.log.info("Starting selected zip download", { count: photoIds.length });
     const archive = archiver("zip", { zlib: { level: 9 } });
 
     res.attachment("selected-photos.zip");
     archive.pipe(res);
 
+    let skipped = 0;
     for (const key of photoIds) {
       try {
         const filename = key.split("/").pop();
@@ -566,13 +600,15 @@ app.post("/api/admin/download-selected", checkAdmin, async (req, res) => {
         );
         archive.append(s3Response.Body, { name: filename });
       } catch (err) {
-        console.warn(`Failed to download ${key}:`, err.message);
+        skipped++;
+        req.log.warn("Skipping file in selected zip", { key, err: err.message });
       }
     }
 
     await archive.finalize();
+    req.log.info("Selected zip complete", { requested: photoIds.length, skipped });
   } catch (err) {
-    console.error("Error creating selected zip:", err);
+    req.log.error("Failed to create selected zip", { err });
     res.status(500).json({ ok: false, error: err.message });
   }
 });
@@ -615,7 +651,7 @@ function buildTree(objects) {
 // --------------------------
 // /api/superadmin/tree endpoint
 // --------------------------
-app.get("/api/superadmin/tree", checkSuperadmin, async (_req, res) => {
+app.get("/api/superadmin/tree", checkSuperadmin, async (req, res) => {
   try {
     const allObjects = [];
     let continuationToken;
@@ -631,9 +667,10 @@ app.get("/api/superadmin/tree", checkSuperadmin, async (_req, res) => {
       continuationToken = response.NextContinuationToken;
     } while (continuationToken);
 
+    req.log.debug("Tree fetched", { totalObjects: allObjects.length });
     res.json({ ok: true, tree: buildTree(allObjects) });
   } catch (err) {
-    console.error("Error in /api/superadmin/tree:", err);
+    req.log.error("Failed to build tree", { err });
     res.status(500).json({ ok: false, error: err.message });
   }
 });
@@ -669,9 +706,10 @@ app.get("/api/superadmin/photos", checkSuperadmin, async (req, res) => {
       })
     );
 
+    req.log.debug("Superadmin photos listed", { prefix: prefix || "(all)", total: files.length });
     res.json({ ok: true, files });
   } catch (err) {
-    console.error("Error in /api/superadmin/photos:", err);
+    req.log.error("Failed to list superadmin photos", { err });
     res.status(500).json({ ok: false, error: err.message });
   }
 });
@@ -692,9 +730,10 @@ app.delete("/api/superadmin/file", checkSuperadmin, async (req, res) => {
     if (!exists) return res.status(404).json({ ok: false, error: "File not found" });
 
     await s3.send(new DeleteObjectCommand({ Bucket: BUCKET_NAME, Key: key }));
+    req.log.info("File deleted", { key });
     res.json({ ok: true, deleted: key });
   } catch (err) {
-    console.error("Error in DELETE /api/superadmin/file:", err);
+    req.log.error("Failed to delete file", { key: req.body?.key, err });
     res.status(500).json({ ok: false, error: err.message });
   }
 });
@@ -724,7 +763,10 @@ app.delete("/api/superadmin/folder", checkSuperadmin, async (req, res) => {
       continuationToken = response.NextContinuationToken;
     } while (continuationToken);
 
-    if (allKeys.length === 0) return res.json({ ok: true, deletedCount: 0 });
+    if (allKeys.length === 0) {
+      req.log.warn("Folder delete: no files found", { prefix });
+      return res.json({ ok: true, deletedCount: 0 });
+    }
 
     await s3.send(
       new DeleteObjectsCommand({
@@ -733,9 +775,10 @@ app.delete("/api/superadmin/folder", checkSuperadmin, async (req, res) => {
       })
     );
 
+    req.log.info("Folder deleted", { prefix, deletedCount: allKeys.length });
     res.json({ ok: true, deletedCount: allKeys.length });
   } catch (err) {
-    console.error("Error in DELETE /api/superadmin/folder:", err);
+    req.log.error("Failed to delete folder", { prefix: req.body?.prefix, err });
     res.status(500).json({ ok: false, error: err.message });
   }
 });
@@ -761,6 +804,7 @@ app.get("/api/superadmin/download-zip", checkSuperadmin, async (req, res) => {
       continuationToken = response.NextContinuationToken;
     } while (continuationToken);
 
+    req.log.info("Starting superadmin zip download", { prefix: prefix || "(all)", fileCount: allObjects.length });
     const archive = archiver("zip", { zlib: { level: 9 } });
     res.attachment("download.zip");
     archive.pipe(res);
@@ -773,8 +817,9 @@ app.get("/api/superadmin/download-zip", checkSuperadmin, async (req, res) => {
     }
 
     await archive.finalize();
+    req.log.info("Superadmin zip complete", { prefix: prefix || "(all)", fileCount: allObjects.length });
   } catch (err) {
-    console.error("Error in /api/superadmin/download-zip:", err);
+    req.log.error("Failed to create superadmin zip", { err });
     res.status(500).json({ ok: false, error: err.message });
   }
 });
@@ -789,10 +834,12 @@ app.post("/api/superadmin/download-selected", checkSuperadmin, async (req, res) 
       return res.status(400).json({ ok: false, error: "Invalid keys array" });
     }
 
+    req.log.info("Starting superadmin selected zip", { count: keys.length });
     const archive = archiver("zip", { zlib: { level: 9 } });
     res.attachment("selected.zip");
     archive.pipe(res);
 
+    let skipped = 0;
     for (const key of keys) {
       try {
         const s3Response = await s3.send(
@@ -800,13 +847,15 @@ app.post("/api/superadmin/download-selected", checkSuperadmin, async (req, res) 
         );
         archive.append(s3Response.Body, { name: key });
       } catch (err) {
-        console.warn(`Skipping ${key}:`, err.message);
+        skipped++;
+        req.log.warn("Skipping file in selected zip", { key, err: err.message });
       }
     }
 
     await archive.finalize();
+    req.log.info("Superadmin selected zip complete", { requested: keys.length, skipped });
   } catch (err) {
-    console.error("Error in /api/superadmin/download-selected:", err);
+    req.log.error("Failed to create superadmin selected zip", { err });
     res.status(500).json({ ok: false, error: err.message });
   }
 });
@@ -824,6 +873,7 @@ app.post("/api/superadmin/move", checkSuperadmin, async (req, res) => {
       return res.status(400).json({ ok: false, error: "Source and destination are the same" });
     }
 
+    req.log.info("Moving file", { from: sourceKey, to: destKey });
     await s3.send(
       new CopyObjectCommand({
         Bucket: BUCKET_NAME,
@@ -834,9 +884,10 @@ app.post("/api/superadmin/move", checkSuperadmin, async (req, res) => {
 
     await s3.send(new DeleteObjectCommand({ Bucket: BUCKET_NAME, Key: sourceKey }));
 
+    req.log.info("File moved", { from: sourceKey, to: destKey });
     res.json({ ok: true, moved: { from: sourceKey, to: destKey } });
   } catch (err) {
-    console.error("Error in /api/superadmin/move:", err);
+    req.log.error("Failed to move file", { from: req.body?.sourceKey, to: req.body?.destKey, err });
     res.status(500).json({ ok: false, error: err.message });
   }
 });
@@ -850,11 +901,13 @@ app.post("/api/superadmin/upload-wallpaper", checkSuperadmin, upload.single("wal
     const ext = extFromMime(req.file.mimetype);
     const name = `wallpaper_${Date.now()}${ext}`;
     const key = `wallpapers/${name}`;
+    req.log.info("Uploading wallpaper", { key, bytes: req.file.buffer.length });
     await uploadToS3(req.file.buffer, key, req.file.mimetype);
     const url = await presignedUrl(key);
+    req.log.info("Wallpaper uploaded", { key });
     res.json({ ok: true, key, url });
   } catch (err) {
-    console.error("Error in /api/superadmin/upload-wallpaper:", err);
+    req.log.error("Failed to upload wallpaper", { err });
     res.status(500).json({ ok: false, error: err.message });
   }
 });
@@ -863,7 +916,7 @@ app.post("/api/superadmin/upload-wallpaper", checkSuperadmin, upload.single("wal
 // Global error handler
 // --------------------------
 app.use((err, req, res, _next) => {
-  console.error(`Unhandled error on ${req.method} ${req.path}:`, err);
+  req.log.error("Unhandled error", { err });
   res.status(500).json({ ok: false, error: err.message });
 });
 
@@ -871,7 +924,17 @@ app.use((err, req, res, _next) => {
 // Start server
 // --------------------------
 (async () => {
+  logger.info("Starting photobooth server", {
+    port: PORT,
+    nodeEnv: process.env.NODE_ENV || "development",
+    logLevel: process.env.LOG_LEVEL || "default",
+    bucket: BUCKET_NAME,
+    mongoUrl: process.env.MONGO_URL ? "(set)" : "(missing)",
+    s3Endpoint: process.env.AWS_ENDPOINT_URL_S3 ? "(set)" : "(missing)",
+  });
+
   await connectDB();
+  logger.info("MongoDB connected");
 
   const anyEvent = await Event.findOne();
   if (!anyEvent) {
@@ -887,10 +950,10 @@ app.use((err, req, res, _next) => {
       qr: { size: 300, margin: 1 },
       is_active: true,
     });
-    console.log('Seeded default "test" event');
+    logger.info('Seeded default "test" event');
   }
 
   app.listen(PORT, () => {
-    console.log(`Photobooth server listening on http://localhost:${PORT}`);
+    logger.info(`Server listening on http://localhost:${PORT}`);
   });
 })();
