@@ -520,12 +520,18 @@ app.get("/api/admin/photos", authLimiter, checkAdmin, async (req, res) => {
       eventId = activeEvent.event_id;
     }
     req.log.debug("Listing admin photos", { eventId });
-    const response = await s3.send(
-      new ListObjectsV2Command({ Bucket: BUCKET_NAME, Prefix: `${eventId}/`, MaxKeys: 500 })
-    );
+    const allObjects = [];
+    let continuationToken;
+    do {
+      const response = await s3.send(
+        new ListObjectsV2Command({ Bucket: BUCKET_NAME, Prefix: `${eventId}/`, ContinuationToken: continuationToken })
+      );
+      allObjects.push(...(response.Contents || []));
+      continuationToken = response.NextContinuationToken;
+    } while (continuationToken);
 
     const photos = await batchMap(
-      response.Contents || [],
+      allObjects,
       async (obj) => {
         const url = await presignedUrl(obj.Key);
         const parts = obj.Key.split("/");
@@ -539,7 +545,7 @@ app.get("/api/admin/photos", authLimiter, checkAdmin, async (req, res) => {
     );
 
     req.log.debug("Admin photos listed", { eventId, total: photos.length });
-    res.json({ ok: true, photos, total: photos.length });
+    res.json({ ok: true, photos, total: photos.length, truncated: false });
   } catch (err) {
     req.log.error("Failed to list admin photos", { err });
     res.status(500).json({ ok: false, error: "Internal server error" });
@@ -719,11 +725,17 @@ app.get("/api/admin/download-zip", authLimiter, checkAdmin, async (req, res) => 
       if (!activeEvent) return res.status(404).json({ ok: false, error: "No active event" });
       eventId = activeEvent.event_id;
     }
-    const response = await s3.send(
-      new ListObjectsV2Command({ Bucket: BUCKET_NAME, Prefix: `${eventId}/`, MaxKeys: 500 })
-    );
+    const allObjects = [];
+    let continuationToken;
+    do {
+      const response = await s3.send(
+        new ListObjectsV2Command({ Bucket: BUCKET_NAME, Prefix: `${eventId}/`, ContinuationToken: continuationToken })
+      );
+      allObjects.push(...(response.Contents || []));
+      continuationToken = response.NextContinuationToken;
+    } while (continuationToken);
 
-    const fileCount = (response.Contents || []).length;
+    const fileCount = allObjects.length;
     req.log.info("Starting zip download", { eventId, fileCount });
 
     const archive = archiver("zip", { zlib: { level: 0 } });
@@ -736,7 +748,7 @@ app.get("/api/admin/download-zip", authLimiter, checkAdmin, async (req, res) => 
       else res.destroy(err);
     });
 
-    for (const obj of response.Contents || []) {
+    for (const obj of allObjects) {
       const filename = obj.Key.split("/").pop();
       const s3Response = await s3.send(
         new GetObjectCommand({ Bucket: BUCKET_NAME, Key: obj.Key })
