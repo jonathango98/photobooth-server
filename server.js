@@ -24,6 +24,7 @@ import QRCode from "qrcode";
 import "dotenv/config";
 import { connectDB } from "./db.js";
 import Event from "./models/Event.js";
+import Session from "./models/Session.js";
 import { logger, requestLogger } from "./logger.js";
 
 // --------------------------
@@ -560,6 +561,9 @@ const cpUpload = upload.fields([
 ]);
 
 app.post("/api/save", uploadLimiter, cpUpload, async (req, res) => {
+  // Tracked before try so the catch block can clean up any partial S3 uploads (#18)
+  let plannedKeys = [];
+
   try {
     const files = req.files || {};
 
@@ -608,6 +612,9 @@ app.post("/api/save", uploadLimiter, cpUpload, async (req, res) => {
     const collageExt = extFromMime(collageFile.mimetype);
     const collageKey = `${eventId}/collage/${sessionId}${collageExt}`;
 
+    // Record all keys we intend to upload so catch can clean them up (#18)
+    plannedKeys = [collageKey, ...rawKeys];
+
     log.debug("Uploading collage + raw photos", { collageKey, rawCount: rawKeys.length, bytes: collageFile.buffer.length });
 
     await Promise.all([
@@ -615,10 +622,17 @@ app.post("/api/save", uploadLimiter, cpUpload, async (req, res) => {
       ...uploadPromises,
     ]);
 
-    // 3) Generate presigned URL for collage
+    // 3) Record session in DB for O(1) status lookups (#66 / #23)
+    await Session.findOneAndUpdate(
+      { sessionId },
+      { sessionId, eventId },
+      { upsert: true, new: true }
+    );
+
+    // 4) Generate presigned URL for collage
     const collageUrl = await presignedUrl(collageKey);
 
-    // 4) Generate QR code from collage URL
+    // 5) Generate QR code from collage URL
     const qrCodeDataUrl = await QRCode.toDataURL(collageUrl);
 
     log.info("Session saved", { collageKey, rawCount: rawKeys.length });
@@ -630,6 +644,13 @@ app.post("/api/save", uploadLimiter, cpUpload, async (req, res) => {
       qrCode: qrCodeDataUrl,
     });
   } catch (err) {
+    // Best-effort cleanup of any partially-uploaded S3 files (#18)
+    if (plannedKeys.length > 0) {
+      s3.send(new DeleteObjectsCommand({
+        Bucket: BUCKET_NAME,
+        Delete: { Objects: plannedKeys.map(Key => ({ Key })), Quiet: true },
+      })).catch(() => {});
+    }
     req.log.error("Failed to save session", { err });
     res.status(500).json({ ok: false, error: "Server error while saving files" });
   }
@@ -685,27 +706,37 @@ app.get("/api/session/:sessionId/status", async (req, res) => {
     return res.status(400).json({ ok: false, error: "Invalid sessionId" });
   }
   try {
-    // Build ordered list of event IDs to check: hinted one first, then all others
+    // Fast path: look up eventId from Session record (O(1) — #23)
+    const session = await Session.findOne({ sessionId }).lean();
+    if (session) {
+      const prefix = `${session.eventId}/collage/${sessionId}`;
+      const listRes = await s3.send(new ListObjectsV2Command({ Bucket: BUCKET_NAME, Prefix: prefix, MaxKeys: 1 }));
+      const match = listRes.Contents?.[0];
+      if (match) {
+        req.log.info("Session ready", { sessionId, key: match.Key });
+        return res.json({ ready: true, url: photoUrl(match.Key, req) });
+      }
+      req.log.debug("Session not ready yet", { sessionId });
+      return res.json({ ready: false });
+    }
+
+    // Fallback for sessions uploaded before the Session collection existed:
+    // scan all events (O(N) — remove once old sessions have expired)
     const hintedId = safeString(req.query.eventId);
     const allEvents = await Event.find().select("event_id").lean();
     const allIds = allEvents.map(e => e.event_id);
-
     const checkOrder = hintedId && /^[A-Za-z0-9_.-]{1,64}$/.test(hintedId)
       ? [hintedId, ...allIds.filter(id => id !== hintedId)]
       : allIds;
 
-    req.log.debug("Status check", { sessionId, hintedEventId: hintedId, checking: checkOrder.length });
+    req.log.debug("Status check (legacy scan)", { sessionId, checking: checkOrder.length });
 
     for (const eventId of checkOrder) {
       const prefix = `${eventId}/collage/${sessionId}`;
-      const listRes = await s3.send(new ListObjectsV2Command({
-        Bucket: BUCKET_NAME,
-        Prefix: prefix,
-        MaxKeys: 1,
-      }));
+      const listRes = await s3.send(new ListObjectsV2Command({ Bucket: BUCKET_NAME, Prefix: prefix, MaxKeys: 1 }));
       const match = listRes.Contents?.[0];
       if (match) {
-        req.log.info("Session ready", { sessionId, key: match.Key });
+        req.log.info("Session ready (legacy)", { sessionId, key: match.Key });
         return res.json({ ready: true, url: photoUrl(match.Key, req) });
       }
     }
