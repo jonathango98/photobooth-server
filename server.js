@@ -42,6 +42,21 @@ const s3 = new S3Client({
   }),
 });
 
+// If the S3 endpoint is an internal/private URL (e.g. a Railway private network address),
+// presigned URLs generated with it won't be reachable from browsers. Set PUBLIC_S3_ENDPOINT
+// to the public-facing URL of the same bucket so browser-loaded images work.
+const s3Presign = process.env.PUBLIC_S3_ENDPOINT
+  ? new S3Client({
+      region: process.env.AWS_REGION || "auto",
+      endpoint: process.env.PUBLIC_S3_ENDPOINT,
+      credentials: {
+        accessKeyId: process.env.AWS_ACCESS_KEY_ID,
+        secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY,
+      },
+      forcePathStyle: true,
+    })
+  : s3;
+
 const BUCKET_NAME = process.env.BUCKET_NAME;
 
 // --------------------------
@@ -88,6 +103,17 @@ app.use((req, res, next) => {
 app.use(express.json());
 app.use(mongoSanitize());
 app.use(requestLogger);
+
+// Prevent 304 Not Modified on API endpoints.
+// Express generates ETags for res.json() by default; browsers send If-None-Match on
+// subsequent requests and receive 304, which the service worker forwards as-is so
+// JavaScript sees response.ok === false. Stripping conditional headers here ensures
+// Express always returns a full 200 response for every API call.
+app.use("/api", (req, _res, next) => {
+  delete req.headers["if-none-match"];
+  delete req.headers["if-modified-since"];
+  next();
+});
 
 // --------------------------
 // Rate limiting
@@ -411,9 +437,9 @@ async function uploadToS3(buffer, key, contentType) {
   );
 }
 
-// Helper: generate a presigned GET URL (24 h)
+// Helper: generate a presigned GET URL (24 h) using the public-facing endpoint
 async function presignedUrl(key) {
-  return getSignedUrl(s3, new GetObjectCommand({ Bucket: BUCKET_NAME, Key: key }), {
+  return getSignedUrl(s3Presign, new GetObjectCommand({ Bucket: BUCKET_NAME, Key: key }), {
     expiresIn: 86400,
   });
 }
@@ -447,9 +473,13 @@ app.post("/api/save", uploadLimiter, cpUpload, async (req, res) => {
       eventId = activeEvent.event_id;
     }
 
-    // Always generate sessionId server-side — never trust client
+    // Use client-provided sessionId if valid (kiosk shows QR before upload completes,
+    // so the ID must match what the server stores). Fall back to a server-generated UUID.
     const { randomUUID } = await import("crypto");
-    const sessionId = randomUUID().replace(/-/g, "");
+    const clientSessionId = safeString(req.body.sessionId);
+    const sessionId = (clientSessionId && /^[A-Za-z0-9_-]{1,64}$/.test(clientSessionId))
+      ? clientSessionId
+      : randomUUID().replace(/-/g, "");
 
     const log = req.log.child({ sessionId, eventId });
     log.info("Save request received");
