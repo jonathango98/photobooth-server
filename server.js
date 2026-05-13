@@ -176,8 +176,10 @@ function timingSafeCompare(a, b) {
   return timingSafeEqual(bA, bB);
 }
 
-// Validate that an S3 key belongs to an allowed prefix to prevent bucket-wide access
-const ALLOWED_KEY_PATTERN = /^([A-Za-z0-9_-]{1,64}\/(raw|collage)\/|wallpapers\/|_templates\/)/;
+// Validate that an S3 key belongs to an allowed prefix to prevent bucket-wide access.
+// Allows any path under a valid event-ID prefix (not just raw/collage) to support older
+// naming conventions where photos were stored in different subfolders.
+const ALLOWED_KEY_PATTERN = /^([A-Za-z0-9_-]{1,64}\/|wallpapers\/|_templates\/)/;
 
 function isAllowedS3Key(key) {
   return typeof key === "string" && ALLOWED_KEY_PATTERN.test(key) && !key.includes("..");
@@ -252,6 +254,7 @@ app.get("/api/photo", photoLimiter, async (req, res) => {
     const s3Resp = await s3.send(new GetObjectCommand({ Bucket: BUCKET_NAME, Key: key }));
     res.setHeader("Content-Type", s3Resp.ContentType || "image/jpeg");
     res.setHeader("Cache-Control", "public, max-age=3600");
+    res.setHeader("Cross-Origin-Resource-Policy", "cross-origin");
     s3Resp.Body.pipe(res);
   } catch (err) {
     req.log.warn("Photo proxy: key not found", { key });
