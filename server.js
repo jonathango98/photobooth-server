@@ -128,6 +128,16 @@ const globalLimiter = rateLimit({
   max: 300,
   standardHeaders: true,
   legacyHeaders: false,
+  skip: (req) => req.path === "/api/photo",
+});
+
+// /api/photo serves one image per thumbnail — an admin grid of 200 photos fires 200
+// requests at once, so it needs its own high-capacity limiter separate from the global one.
+const photoLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  max: 600,
+  standardHeaders: true,
+  legacyHeaders: false,
 });
 
 const authLimiter = rateLimit({
@@ -235,7 +245,7 @@ function photoUrl(key, req) {
   return `${base}/api/photo?key=${encodeURIComponent(key)}`;
 }
 
-app.get("/api/photo", async (req, res) => {
+app.get("/api/photo", photoLimiter, async (req, res) => {
   const key = safeString(req.query.key);
   if (!key || !isAllowedS3Key(key)) return res.status(400).json({ error: "Invalid key" });
   try {
