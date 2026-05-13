@@ -1,3 +1,5 @@
+import { randomUUID } from "crypto";
+
 const LEVELS = { debug: 0, info: 1, warn: 2, error: 3 };
 
 const envLevel = (process.env.LOG_LEVEL || (process.env.NODE_ENV === "production" ? "info" : "debug")).toLowerCase();
@@ -66,7 +68,7 @@ export const logger = makeLogger();
 
 // Express middleware: logs every request with a short request ID, method, path, status, and duration.
 export function requestLogger(req, res, next) {
-  const reqId = Math.random().toString(36).slice(2, 8);
+  const reqId = randomUUID().slice(0, 8);
   const start = Date.now();
   req.log = logger.child({ reqId });
 

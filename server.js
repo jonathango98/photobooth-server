@@ -39,6 +39,8 @@ const s3 = new S3Client({
   forcePathStyle: true,
   requestHandler: new NodeHttpHandler({
     httpsAgent: new https.Agent({ maxSockets: 500, keepAlive: true }),
+    requestTimeout: 30000,
+    connectionTimeout: 5000,
   }),
 });
 
@@ -1222,9 +1224,9 @@ app.use((err, req, res, _next) => {
   await connectDB();
   logger.info("MongoDB connected");
 
-  const anyEvent = await Event.findOne();
-  if (!anyEvent) {
-    const seedEvent = new Event({
+  const result = await Event.findOneAndUpdate(
+    { event_id: "test" },
+    { $setOnInsert: {
       event_id: "test",
       event_name: "test server",
       templates: [
@@ -1235,10 +1237,10 @@ app.use((err, req, res, _next) => {
       gestureTrigger: { enabled: false, gestureType: "peace", holdDuration: 1000, detectionFps: 10 },
       qr: { size: 300, margin: 1 },
       is_active: true,
-    });
-    await seedEvent.save();
-    logger.info('Seeded default "test" event');
-  }
+    }},
+    { upsert: true, new: false }
+  );
+  if (!result) logger.info('Seeded default "test" event');
 
   app.listen(PORT, () => {
     logger.info(`Server listening on http://localhost:${PORT}`);
