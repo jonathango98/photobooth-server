@@ -27,6 +27,18 @@ import Event from "./models/Event.js";
 import { logger, requestLogger } from "./logger.js";
 
 // --------------------------
+// Fail fast on missing required env vars
+// --------------------------
+{
+  const required = ["MONGO_URL", "BUCKET_NAME", "AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "AWS_ENDPOINT_URL_S3"];
+  const missing = required.filter(k => !process.env[k]);
+  if (missing.length > 0) {
+    console.error(`[startup] Missing required environment variables: ${missing.join(", ")}`);
+    process.exit(1);
+  }
+}
+
+// --------------------------
 // Railway Bucket (S3-compatible) configuration
 // --------------------------
 const s3 = new S3Client({
@@ -188,6 +200,26 @@ function isAllowedS3Key(key) {
 }
 
 // --------------------------
+// Active event cache (30 s TTL — invalidated on activate/deactivate)
+// --------------------------
+let _activeEventCache = null;
+let _activeEventCacheAt = 0;
+const ACTIVE_EVENT_TTL = 30_000;
+
+async function getActiveEvent() {
+  if (_activeEventCache && Date.now() - _activeEventCacheAt < ACTIVE_EVENT_TTL) {
+    return _activeEventCache;
+  }
+  _activeEventCache = await Event.findOne({ is_active: true });
+  _activeEventCacheAt = Date.now();
+  return _activeEventCache;
+}
+
+function invalidateActiveEventCache() {
+  _activeEventCache = null;
+}
+
+// --------------------------
 // Admin auth middleware
 // --------------------------
 const checkAdmin = async (req, res, next) => {
@@ -231,10 +263,25 @@ const checkSuperadmin = (req, res, next) => {
 };
 
 // --------------------------
-// /health endpoint (health check)
+// /health — liveness probe (always OK if process is running)
+// /ready  — readiness probe (checks MongoDB + S3)
 // --------------------------
 app.get("/health", (_req, res) => {
   res.json({ ok: true });
+});
+
+app.get("/ready", async (_req, res) => {
+  const checks = { mongo: false, s3: false };
+  try {
+    const mongoose = await import("mongoose");
+    checks.mongo = mongoose.default.connection.readyState === 1;
+  } catch { /* ignore */ }
+  try {
+    await s3.send(new ListObjectsV2Command({ Bucket: BUCKET_NAME, MaxKeys: 1 }));
+    checks.s3 = true;
+  } catch { /* ignore */ }
+  const ok = checks.mongo && checks.s3;
+  res.status(ok ? 200 : 503).json({ ok, checks });
 });
 
 // --------------------------
@@ -269,7 +316,7 @@ app.get("/api/photo", photoLimiter, async (req, res) => {
 // --------------------------
 app.get("/api/event", async (req, res) => {
   try {
-    const event = await Event.findOne({ is_active: true });
+    const event = await getActiveEvent();
     if (!event) return res.status(404).json({ ok: false, error: "No active event" });
     res.json({ eventId: event.event_id });
   } catch (err) {
@@ -283,9 +330,11 @@ app.get("/api/event", async (req, res) => {
 // --------------------------
 app.get("/api/event/config", async (req, res) => {
   try {
-    const event = await Event.findOne({ is_active: true }).select("-admin_password");
+    const event = await getActiveEvent();
     if (!event) return res.status(404).json({ ok: false, error: "No active event found" });
-    res.json(event);
+    const safe = event.toObject ? event.toObject() : { ...event };
+    delete safe.admin_password;
+    res.json(safe);
   } catch (err) {
     req.log.error("Failed to fetch active event config", { err });
     res.status(500).json({ ok: false, error: "Internal server error" });
@@ -400,6 +449,7 @@ app.post("/api/superadmin/events/:eventId/activate", checkSuperadmin, async (req
       { new: true }
     ).select("-admin_password");
     if (!event) return res.status(404).json({ ok: false, error: "Event not found" });
+    invalidateActiveEventCache();
     req.log.info("Event activated", { eventId: event.event_id });
     res.json({ ok: true, event_id: event.event_id });
   } catch (err) {
@@ -420,6 +470,7 @@ app.post("/api/superadmin/events/:eventId/deactivate", checkSuperadmin, async (r
       { new: true }
     ).select("-admin_password");
     if (!event) return res.status(404).json({ ok: false, error: "Event not found" });
+    invalidateActiveEventCache();
     req.log.info("Event deactivated", { eventId: event.event_id });
     res.json({ ok: true, event_id: event.event_id });
   } catch (err) {
@@ -514,7 +565,7 @@ app.post("/api/save", uploadLimiter, cpUpload, async (req, res) => {
 
     let eventId = safeString(req.body.eventId);
     if (!eventId || !/^[A-Za-z0-9_-]{1,64}$/.test(eventId)) {
-      const activeEvent = await Event.findOne({ is_active: true });
+      const activeEvent = await getActiveEvent();
       if (!activeEvent) return res.status(404).json({ ok: false, error: "No active event" });
       eventId = activeEvent.event_id;
     }
@@ -591,7 +642,7 @@ app.get("/api/admin/photos", authLimiter, checkAdmin, async (req, res) => {
   try {
     let eventId = safeString(req.query.eventId);
     if (!eventId || !/^[A-Za-z0-9_-]{1,64}$/.test(eventId)) {
-      const activeEvent = await Event.findOne({ is_active: true });
+      const activeEvent = await getActiveEvent();
       if (!activeEvent) return res.status(404).json({ ok: false, error: "No active event" });
       eventId = activeEvent.event_id;
     }
@@ -757,7 +808,7 @@ app.get("/api/public/photos", async (req, res) => {
   try {
     let eventId = safeString(req.query.eventId);
     if (!eventId || !/^[A-Za-z0-9_-]{1,64}$/.test(eventId)) {
-      const activeEvent = await Event.findOne({ is_active: true });
+      const activeEvent = await getActiveEvent();
       if (!activeEvent) return res.status(404).json({ ok: false, error: "No active event" });
       eventId = activeEvent.event_id;
     }
@@ -789,7 +840,7 @@ app.get("/api/admin/download-zip", authLimiter, checkAdmin, async (req, res) => 
   try {
     let eventId = safeString(req.query.eventId);
     if (!eventId || !/^[A-Za-z0-9_-]{1,64}$/.test(eventId)) {
-      const activeEvent = await Event.findOne({ is_active: true });
+      const activeEvent = await getActiveEvent();
       if (!activeEvent) return res.status(404).json({ ok: false, error: "No active event" });
       eventId = activeEvent.event_id;
     }
@@ -821,6 +872,10 @@ app.get("/api/admin/download-zip", authLimiter, checkAdmin, async (req, res) => 
       const s3Response = await s3.send(
         new GetObjectCommand({ Bucket: BUCKET_NAME, Key: obj.Key })
       );
+      s3Response.Body.on("error", err => {
+        req.log.warn("S3 stream error in zip", { key: obj.Key, err: err.message });
+        archive.abort();
+      });
       archive.append(s3Response.Body, { name: filename });
     }
 
@@ -867,6 +922,10 @@ app.post("/api/admin/download-selected", authLimiter, checkAdmin, async (req, re
         const s3Response = await s3.send(
           new GetObjectCommand({ Bucket: BUCKET_NAME, Key: key })
         );
+        s3Response.Body.on("error", err => {
+          req.log.warn("S3 stream error in selected zip", { key, err: err.message });
+          archive.abort();
+        });
         archive.append(s3Response.Body, { name: filename });
       } catch (err) {
         skipped++;
@@ -1087,6 +1146,10 @@ app.get("/api/superadmin/download-zip", checkSuperadmin, async (req, res) => {
       const s3Response = await s3.send(
         new GetObjectCommand({ Bucket: BUCKET_NAME, Key: obj.Key })
       );
+      s3Response.Body.on("error", err => {
+        req.log.warn("S3 stream error in superadmin zip", { key: obj.Key, err: err.message });
+        archive.abort();
+      });
       archive.append(s3Response.Body, { name: obj.Key });
     }
 
@@ -1129,6 +1192,10 @@ app.post("/api/superadmin/download-selected", checkSuperadmin, async (req, res) 
         const s3Response = await s3.send(
           new GetObjectCommand({ Bucket: BUCKET_NAME, Key: key })
         );
+        s3Response.Body.on("error", err => {
+          req.log.warn("S3 stream error in superadmin selected zip", { key, err: err.message });
+          archive.abort();
+        });
         archive.append(s3Response.Body, { name: key });
       } catch (err) {
         skipped++;
@@ -1242,9 +1309,29 @@ app.use((err, req, res, _next) => {
   );
   if (!result) logger.info('Seeded default "test" event');
 
-  app.listen(PORT, () => {
+  const server = app.listen(PORT, () => {
     logger.info(`Server listening on http://localhost:${PORT}`);
   });
+
+  const shutdown = () => {
+    logger.info("SIGTERM received — shutting down gracefully");
+    server.close(async () => {
+      try {
+        await import("mongoose").then(m => m.default.disconnect());
+        logger.info("MongoDB disconnected — exiting");
+      } catch {
+        // best-effort
+      }
+      process.exit(0);
+    });
+    setTimeout(() => {
+      logger.error("Shutdown timed out — forcing exit");
+      process.exit(1);
+    }, 10000);
+  };
+
+  process.on("SIGTERM", shutdown);
+  process.on("SIGINT", shutdown);
 })().catch(err => {
   logger.error("Startup failed", { err });
   process.exit(1);
