@@ -59,6 +59,11 @@ const s3Presign = process.env.PUBLIC_S3_ENDPOINT
 
 const BUCKET_NAME = process.env.BUCKET_NAME;
 
+// Public base URL of this server — used to build absolute proxy URLs for browser clients.
+// Railway injects RAILWAY_PUBLIC_DOMAIN automatically; set SERVER_URL to override.
+const SERVER_URL = process.env.SERVER_URL
+  || (process.env.RAILWAY_PUBLIC_DOMAIN ? `https://${process.env.RAILWAY_PUBLIC_DOMAIN}` : null);
+
 // --------------------------
 // __dirname replacement in ESM
 // --------------------------
@@ -216,6 +221,32 @@ const checkSuperadmin = (req, res, next) => {
 // --------------------------
 app.get("/health", (_req, res) => {
   res.json({ ok: true });
+});
+
+// --------------------------
+// Helpers: photo proxy URL + /api/photo endpoint
+//
+// Presigned S3 URLs are signed against the internal S3 endpoint and may not be
+// reachable from browsers. Instead we serve images through this server, which
+// already has working server-to-S3 access (same path downloads take).
+// --------------------------
+function photoUrl(key, req) {
+  const base = SERVER_URL || `${req.protocol}://${req.get("host")}`;
+  return `${base}/api/photo?key=${encodeURIComponent(key)}`;
+}
+
+app.get("/api/photo", async (req, res) => {
+  const key = safeString(req.query.key);
+  if (!key || !isAllowedS3Key(key)) return res.status(400).json({ error: "Invalid key" });
+  try {
+    const s3Resp = await s3.send(new GetObjectCommand({ Bucket: BUCKET_NAME, Key: key }));
+    res.setHeader("Content-Type", s3Resp.ContentType || "image/jpeg");
+    res.setHeader("Cache-Control", "public, max-age=3600");
+    s3Resp.Body.pipe(res);
+  } catch (err) {
+    req.log.warn("Photo proxy: key not found", { key });
+    res.status(404).json({ error: "Not found" });
+  }
 });
 
 // --------------------------
@@ -560,19 +591,15 @@ app.get("/api/admin/photos", authLimiter, checkAdmin, async (req, res) => {
       continuationToken = response.NextContinuationToken;
     } while (continuationToken);
 
-    const photos = await batchMap(
-      allObjects,
-      async (obj) => {
-        const url = await presignedUrl(obj.Key);
-        const parts = obj.Key.split("/");
-        return {
-          id: obj.Key,
-          url,
-          uploadedAt: obj.LastModified,
-          folder: parts.length > 2 ? parts[1] : "root",
-        };
-      }
-    );
+    const photos = allObjects.map((obj) => {
+      const parts = obj.Key.split("/");
+      return {
+        id: obj.Key,
+        url: photoUrl(obj.Key, req),
+        uploadedAt: obj.LastModified,
+        folder: parts.length > 2 ? parts[1] : "root",
+      };
+    });
 
     req.log.debug("Admin photos listed", { eventId, total: photos.length });
     res.json({ ok: true, photos, total: photos.length, truncated: false });
@@ -613,8 +640,7 @@ app.get("/api/session/:sessionId/status", async (req, res) => {
       const match = listRes.Contents?.[0];
       if (match) {
         req.log.info("Session ready", { sessionId, key: match.Key });
-        const url = await presignedUrl(match.Key);
-        return res.json({ ready: true, url });
+        return res.json({ ready: true, url: photoUrl(match.Key, req) });
       }
     }
 
@@ -728,14 +754,11 @@ app.get("/api/public/photos", async (req, res) => {
         MaxKeys: 1000,
       })
     );
-    const photos = await batchMap(
-      response.Contents || [],
-      async (obj) => ({
-        id: obj.Key,
-        url: await presignedUrl(obj.Key),
-        uploadedAt: obj.LastModified,
-      })
-    );
+    const photos = (response.Contents || []).map((obj) => ({
+      id: obj.Key,
+      url: photoUrl(obj.Key, req),
+      uploadedAt: obj.LastModified,
+    }));
     req.log.debug("Public photos listed", { eventId, total: photos.length });
     res.json({ ok: true, eventId, total: photos.length, photos });
   } catch (err) {
@@ -928,15 +951,12 @@ app.get("/api/superadmin/photos", checkSuperadmin, async (req, res) => {
       continuationToken = response.NextContinuationToken;
     } while (continuationToken);
 
-    const files = await batchMap(
-      allObjects,
-      async (obj) => ({
-        key: obj.Key,
-        url: await presignedUrl(obj.Key),
-        size: obj.Size,
-        lastModified: obj.LastModified,
-      })
-    );
+    const files = allObjects.map((obj) => ({
+      key: obj.Key,
+      url: photoUrl(obj.Key, req),
+      size: obj.Size,
+      lastModified: obj.LastModified,
+    }));
 
     req.log.debug("Superadmin photos listed", { prefix: prefix || "(all)", total: files.length });
     res.json({ ok: true, files });
@@ -1157,9 +1177,8 @@ app.post("/api/superadmin/upload-wallpaper", checkSuperadmin, upload.single("wal
     const key = `wallpapers/${name}`;
     req.log.info("Uploading wallpaper", { key, bytes: req.file.buffer.length });
     await uploadToS3(req.file.buffer, key, req.file.mimetype);
-    const url = await presignedUrl(key);
     req.log.info("Wallpaper uploaded", { key });
-    res.json({ ok: true, key, url });
+    res.json({ ok: true, key, url: photoUrl(key, req) });
   } catch (err) {
     req.log.error("Failed to upload wallpaper", { err });
     res.status(500).json({ ok: false, error: "Internal server error" });
