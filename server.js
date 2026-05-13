@@ -322,8 +322,6 @@ app.post("/api/superadmin/events/:eventId/activate", checkSuperadmin, async (req
     if (!eventId || !/^[A-Za-z0-9_-]{1,64}$/.test(eventId)) {
       return res.status(400).json({ ok: false, error: "Invalid eventId" });
     }
-    // Deactivate all other events first
-    await Event.updateMany({ event_id: { $ne: eventId } }, { is_active: false, updated_at: new Date() });
     const event = await Event.findOneAndUpdate(
       { event_id: eventId },
       { is_active: true, updated_at: new Date() },
