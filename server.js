@@ -2,7 +2,12 @@ import express from "express";
 import path from "path";
 import multer from "multer";
 import https from "https";
+import { timingSafeEqual } from "crypto";
 import { fileURLToPath } from "url";
+import helmet from "helmet";
+import rateLimit from "express-rate-limit";
+import mongoSanitize from "express-mongo-sanitize";
+import bcrypt from "bcryptjs";
 import {
   S3Client,
   PutObjectCommand,
@@ -51,42 +56,128 @@ const __dirname = path.dirname(__filename);
 const app = express();
 const PORT = process.env.PORT || 3000;
 
+app.set("trust proxy", 1);
+app.set("query parser", "simple");
+
 app.use(express.static(path.join(__dirname, "public")));
 
+// --------------------------
+// Security headers
+// --------------------------
+app.use(helmet());
+
+// --------------------------
+// CORS — whitelist allowed origins
+// --------------------------
+const RAW_ORIGINS = process.env.ALLOWED_ORIGINS || "http://localhost:5500,http://localhost:3000,http://localhost:8080";
+const ALLOWED_ORIGINS = new Set(RAW_ORIGINS.split(",").map(o => o.trim()).filter(Boolean));
+
 app.use((req, res, next) => {
-  res.header("Access-Control-Allow-Origin", "*");
+  const origin = req.headers.origin;
+  if (origin && ALLOWED_ORIGINS.has(origin)) {
+    res.header("Access-Control-Allow-Origin", origin);
+    res.header("Vary", "Origin");
+  }
   res.header("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS");
   res.header("Access-Control-Allow-Headers", "Content-Type, x-admin-password, x-superadmin-password");
+  res.header("Access-Control-Max-Age", "600");
   if (req.method === "OPTIONS") return res.sendStatus(200);
   next();
 });
 
 app.use(express.json());
+app.use(mongoSanitize());
 app.use(requestLogger);
+
+// --------------------------
+// Rate limiting
+// --------------------------
+const globalLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 300,
+  standardHeaders: true,
+  legacyHeaders: false,
+});
+
+const authLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 30,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { ok: false, error: "Too many auth attempts, please try again later" },
+});
+
+const uploadLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  max: 20,
+  standardHeaders: true,
+  legacyHeaders: false,
+});
+
+app.use(globalLimiter);
+
+// --------------------------
+// Helpers
+// --------------------------
+
+function safeString(val) {
+  return typeof val === "string" ? val.trim() : null;
+}
+
+function timingSafeCompare(a, b) {
+  if (!a || !b) return false;
+  const bA = Buffer.from(String(a));
+  const bB = Buffer.from(String(b));
+  if (bA.length !== bB.length) {
+    timingSafeEqual(bA, Buffer.alloc(bA.length));
+    return false;
+  }
+  return timingSafeEqual(bA, bB);
+}
+
+// Validate that an S3 key belongs to an allowed prefix to prevent bucket-wide access
+const ALLOWED_KEY_PATTERN = /^([A-Za-z0-9_-]{1,64}\/(raw|collage)\/|wallpapers\/|_templates\/)/;
+
+function isAllowedS3Key(key) {
+  return typeof key === "string" && ALLOWED_KEY_PATTERN.test(key) && !key.includes("..");
+}
 
 // --------------------------
 // Admin auth middleware
 // --------------------------
 const checkAdmin = async (req, res, next) => {
-  const password = req.headers["x-admin-password"];
-  if (!password) {
-    req.log.warn("Admin auth rejected: no password header");
-    return res.status(401).json({ error: "Unauthorized" });
+  try {
+    const password = req.headers["x-admin-password"];
+    if (!password) {
+      req.log.warn("Admin auth rejected: no password header");
+      return res.status(401).json({ error: "Unauthorized" });
+    }
+
+    // Check global admin password with timing-safe comparison
+    if (process.env.ADMIN_PASSWORD && timingSafeCompare(password, process.env.ADMIN_PASSWORD)) {
+      return next();
+    }
+
+    // Check per-event password (bcrypt hashed in DB)
+    const eventId = safeString(req.query.eventId) || safeString(req.body?.eventId);
+    if (eventId && /^[A-Za-z0-9_-]{1,64}$/.test(eventId)) {
+      const event = await Event.findOne({ event_id: eventId }).select("+admin_password");
+      if (event?.admin_password && await bcrypt.compare(password, event.admin_password)) {
+        return next();
+      }
+    }
+
+    req.log.warn("Admin auth rejected: wrong password", { eventId });
+    res.status(401).json({ error: "Unauthorized" });
+  } catch (err) {
+    req.log.error("Admin auth error", { err });
+    res.status(500).json({ error: "Internal server error" });
   }
-  if (password === process.env.ADMIN_PASSWORD) return next();
-  // Check per-event password
-  const eventId = req.query.eventId?.trim() || req.body?.eventId?.trim();
-  if (eventId) {
-    const event = await Event.findOne({ event_id: eventId }).select("admin_password");
-    if (event?.admin_password && password === event.admin_password) return next();
-  }
-  req.log.warn("Admin auth rejected: wrong password", { eventId });
-  res.status(401).json({ error: "Unauthorized" });
 };
 
 const checkSuperadmin = (req, res, next) => {
   const password = req.headers["x-superadmin-password"];
-  if (password && password === process.env.SUPERADMIN_PASSWORD) {
+  if (password && process.env.SUPERADMIN_PASSWORD && timingSafeCompare(password, process.env.SUPERADMIN_PASSWORD)) {
     next();
   } else {
     req.log.warn("Superadmin auth rejected");
@@ -111,35 +202,39 @@ app.get("/api/event", async (req, res) => {
     res.json({ eventId: event.event_id });
   } catch (err) {
     req.log.error("Failed to get active event", { err });
-    res.status(500).json({ ok: false, error: err.message });
+    res.status(500).json({ ok: false, error: "Internal server error" });
   }
 });
 
 // --------------------------
-// /api/event/config endpoint (no auth required)
+// /api/event/config endpoint (no auth required — never returns admin_password)
 // --------------------------
 app.get("/api/event/config", async (req, res) => {
   try {
-    const event = await Event.findOne({ is_active: true });
+    const event = await Event.findOne({ is_active: true }).select("-admin_password");
     if (!event) return res.status(404).json({ ok: false, error: "No active event found" });
     res.json(event);
   } catch (err) {
     req.log.error("Failed to fetch active event config", { err });
-    res.status(500).json({ ok: false, error: err.message });
+    res.status(500).json({ ok: false, error: "Internal server error" });
   }
 });
 
 // --------------------------
-// /api/event/:eventId/config endpoint (no auth required, fetch any event by ID)
+// /api/event/:eventId/config endpoint (no auth required — never returns admin_password)
 // --------------------------
 app.get("/api/event/:eventId/config", async (req, res) => {
   try {
-    const event = await Event.findOne({ event_id: req.params.eventId });
+    const eventId = safeString(req.params.eventId);
+    if (!eventId || !/^[A-Za-z0-9_-]{1,64}$/.test(eventId)) {
+      return res.status(400).json({ ok: false, error: "Invalid eventId" });
+    }
+    const event = await Event.findOne({ event_id: eventId }).select("-admin_password");
     if (!event || !event.is_active) return res.status(404).json({ ok: false, error: "Event not found" });
     res.json(event);
   } catch (err) {
     req.log.error("Failed to fetch event config", { eventId: req.params.eventId, err });
-    res.status(500).json({ ok: false, error: err.message });
+    res.status(500).json({ ok: false, error: "Internal server error" });
   }
 });
 
@@ -148,79 +243,151 @@ app.get("/api/event/:eventId/config", async (req, res) => {
 // --------------------------
 app.get("/api/superadmin/events", checkSuperadmin, async (req, res) => {
   try {
-    const events = await Event.find().sort({ created_at: -1 });
+    const events = await Event.find().select("-admin_password").sort({ created_at: -1 });
     req.log.debug("Listed events", { count: events.length });
     res.json({ ok: true, events });
   } catch (err) {
     req.log.error("Failed to list events", { err });
-    res.status(500).json({ ok: false, error: err.message });
+    res.status(500).json({ ok: false, error: "Internal server error" });
   }
 });
 
+// Allowed fields for event create/update — prevents mass-assignment
+const EVENT_ALLOWED_FIELDS = [
+  "event_id", "event_name", "templates", "capture", "countdown",
+  "gestureTrigger", "qr", "background_url", "admin_password",
+];
+
+function pickEventFields(body) {
+  const out = {};
+  for (const key of EVENT_ALLOWED_FIELDS) {
+    if (Object.prototype.hasOwnProperty.call(body, key)) out[key] = body[key];
+  }
+  return out;
+}
+
 app.post("/api/superadmin/events", checkSuperadmin, async (req, res) => {
   try {
-    const existing = await Event.findOne({ event_id: req.body.event_id });
+    const fields = pickEventFields(req.body);
+    if (!fields.event_id || !/^[A-Za-z0-9_-]{1,64}$/.test(fields.event_id)) {
+      return res.status(400).json({ ok: false, error: "Invalid or missing event_id" });
+    }
+    const existing = await Event.findOne({ event_id: fields.event_id });
     if (existing) return res.status(409).json({ ok: false, error: "event_id already exists" });
-    const event = await Event.create(req.body);
+    // Newly created events are inactive by default — superadmin must explicitly activate
+    fields.is_active = false;
+    const event = new Event(fields);
+    await event.save(); // triggers pre-save hook (bcrypt, updated_at)
+    const safe = event.toObject();
+    delete safe.admin_password;
     req.log.info("Event created", { eventId: event.event_id });
-    res.json({ ok: true, event });
+    res.json({ ok: true, event: safe });
   } catch (err) {
     req.log.error("Failed to create event", { eventId: req.body.event_id, err });
-    res.status(500).json({ ok: false, error: err.message });
+    res.status(500).json({ ok: false, error: "Internal server error" });
   }
 });
 
 app.put("/api/superadmin/events/:eventId", checkSuperadmin, async (req, res) => {
   try {
+    const eventId = safeString(req.params.eventId);
+    if (!eventId || !/^[A-Za-z0-9_-]{1,64}$/.test(eventId)) {
+      return res.status(400).json({ ok: false, error: "Invalid eventId" });
+    }
+    const fields = pickEventFields(req.body);
+    delete fields.event_id; // never allow renaming event_id
+
+    // Hash password if being updated, then use findOneAndUpdate
+    if (fields.admin_password) {
+      fields.admin_password = await bcrypt.hash(fields.admin_password, 12);
+    }
+
     const event = await Event.findOneAndUpdate(
-      { event_id: req.params.eventId },
-      { ...req.body, updated_at: new Date() },
+      { event_id: eventId },
+      { ...fields, updated_at: new Date() },
       { new: true }
-    );
+    ).select("-admin_password");
     if (!event) return res.status(404).json({ ok: false, error: "Event not found" });
-    req.log.info("Event updated", { eventId: req.params.eventId });
+    req.log.info("Event updated", { eventId });
     res.json({ ok: true, event });
   } catch (err) {
     req.log.error("Failed to update event", { eventId: req.params.eventId, err });
-    res.status(500).json({ ok: false, error: err.message });
+    res.status(500).json({ ok: false, error: "Internal server error" });
   }
 });
 
 app.post("/api/superadmin/events/:eventId/activate", checkSuperadmin, async (req, res) => {
   try {
+    const eventId = safeString(req.params.eventId);
+    if (!eventId || !/^[A-Za-z0-9_-]{1,64}$/.test(eventId)) {
+      return res.status(400).json({ ok: false, error: "Invalid eventId" });
+    }
+    // Deactivate all other events first
+    await Event.updateMany({ event_id: { $ne: eventId } }, { is_active: false, updated_at: new Date() });
     const event = await Event.findOneAndUpdate(
-      { event_id: req.params.eventId },
+      { event_id: eventId },
       { is_active: true, updated_at: new Date() },
       { new: true }
-    );
+    ).select("-admin_password");
     if (!event) return res.status(404).json({ ok: false, error: "Event not found" });
     req.log.info("Event activated", { eventId: event.event_id });
     res.json({ ok: true, event_id: event.event_id });
   } catch (err) {
     req.log.error("Failed to activate event", { eventId: req.params.eventId, err });
-    res.status(500).json({ ok: false, error: err.message });
+    res.status(500).json({ ok: false, error: "Internal server error" });
+  }
+});
+
+app.post("/api/superadmin/events/:eventId/deactivate", checkSuperadmin, async (req, res) => {
+  try {
+    const eventId = safeString(req.params.eventId);
+    if (!eventId || !/^[A-Za-z0-9_-]{1,64}$/.test(eventId)) {
+      return res.status(400).json({ ok: false, error: "Invalid eventId" });
+    }
+    const event = await Event.findOneAndUpdate(
+      { event_id: eventId },
+      { is_active: false, updated_at: new Date() },
+      { new: true }
+    ).select("-admin_password");
+    if (!event) return res.status(404).json({ ok: false, error: "Event not found" });
+    req.log.info("Event deactivated", { eventId: event.event_id });
+    res.json({ ok: true, event_id: event.event_id });
+  } catch (err) {
+    req.log.error("Failed to deactivate event", { eventId: req.params.eventId, err });
+    res.status(500).json({ ok: false, error: "Internal server error" });
   }
 });
 
 app.delete("/api/superadmin/events/:eventId", checkSuperadmin, async (req, res) => {
   try {
-    const result = await Event.deleteOne({ event_id: req.params.eventId });
+    const eventId = safeString(req.params.eventId);
+    if (!eventId || !/^[A-Za-z0-9_-]{1,64}$/.test(eventId)) {
+      return res.status(400).json({ ok: false, error: "Invalid eventId" });
+    }
+    const result = await Event.deleteOne({ event_id: eventId });
     if (result.deletedCount === 0) return res.status(404).json({ ok: false, error: "Event not found" });
-    req.log.info("Event deleted", { eventId: req.params.eventId });
+    req.log.info("Event deleted", { eventId });
     res.json({ ok: true });
   } catch (err) {
     req.log.error("Failed to delete event", { eventId: req.params.eventId, err });
-    res.status(500).json({ ok: false, error: err.message });
+    res.status(500).json({ ok: false, error: "Internal server error" });
   }
 });
 
 // --------------------------
-// Multer setup (in-memory)
+// Multer setup (in-memory, images only)
 // --------------------------
+const ALLOWED_IMAGE_TYPES = new Set(["image/jpeg", "image/png", "image/webp"]);
+
 const upload = multer({
   storage: multer.memoryStorage(),
-  limits: {
-    fileSize: 10 * 1024 * 1024, // 10 MB per file
+  limits: { fileSize: 10 * 1024 * 1024 },
+  fileFilter(_req, file, cb) {
+    if (ALLOWED_IMAGE_TYPES.has(file.mimetype)) {
+      cb(null, true);
+    } else {
+      cb(new Error(`Unsupported file type: ${file.mimetype}`));
+    }
   },
 });
 
@@ -229,9 +396,7 @@ function extFromMime(mimetype) {
   const map = {
     "image/jpeg": ".jpg",
     "image/png": ".png",
-    "image/gif": ".gif",
     "image/webp": ".webp",
-    "image/bmp": ".bmp",
   };
   return map[mimetype] || ".bin";
 }
@@ -248,10 +413,10 @@ async function uploadToS3(buffer, key, contentType) {
   );
 }
 
-// Helper: generate a presigned GET URL (7-day max)
+// Helper: generate a presigned GET URL (24 h)
 async function presignedUrl(key) {
   return getSignedUrl(s3, new GetObjectCommand({ Bucket: BUCKET_NAME, Key: key }), {
-    expiresIn: 604800, // 7 days
+    expiresIn: 86400,
   });
 }
 
@@ -273,20 +438,20 @@ const cpUpload = upload.fields([
   { name: "collage", maxCount: 1 },
 ]);
 
-app.post("/api/save", cpUpload, async (req, res) => {
+app.post("/api/save", uploadLimiter, cpUpload, async (req, res) => {
   try {
     const files = req.files || {};
 
-    let eventId = req.body.eventId?.trim();
-    if (!eventId) {
+    let eventId = safeString(req.body.eventId);
+    if (!eventId || !/^[A-Za-z0-9_-]{1,64}$/.test(eventId)) {
       const activeEvent = await Event.findOne({ is_active: true });
       if (!activeEvent) return res.status(404).json({ ok: false, error: "No active event" });
       eventId = activeEvent.event_id;
     }
-    const rawClientId = req.body.sessionId?.trim() ?? "";
-    const sessionId = /^[A-Za-z0-9_-]{1,64}$/.test(rawClientId)
-      ? rawClientId
-      : Date.now().toString();
+
+    // Always generate sessionId server-side — never trust client
+    const { randomUUID } = await import("crypto");
+    const sessionId = randomUUID().replace(/-/g, "");
 
     const log = req.log.child({ sessionId, eventId });
     log.info("Save request received");
@@ -311,7 +476,7 @@ app.post("/api/save", cpUpload, async (req, res) => {
     const collageArr = files["collage"];
     if (!collageArr || collageArr.length === 0) {
       log.warn("No collage file in request");
-      return res.status(400).send("No collage file received");
+      return res.status(400).json({ ok: false, error: "No collage file received" });
     }
 
     const collageFile = collageArr[0];
@@ -325,7 +490,7 @@ app.post("/api/save", cpUpload, async (req, res) => {
       ...uploadPromises,
     ]);
 
-    // 3) Generate presigned URL for collage (for QR code, valid 7 days)
+    // 3) Generate presigned URL for collage
     const collageUrl = await presignedUrl(collageKey);
 
     // 4) Generate QR code from collage URL
@@ -333,7 +498,6 @@ app.post("/api/save", cpUpload, async (req, res) => {
 
     log.info("Session saved", { collageKey, rawCount: rawKeys.length });
 
-    // 5) Respond JSON
     res.json({
       ok: true,
       sessionId,
@@ -342,17 +506,17 @@ app.post("/api/save", cpUpload, async (req, res) => {
     });
   } catch (err) {
     req.log.error("Failed to save session", { err });
-    res.status(500).send("Server error while saving files");
+    res.status(500).json({ ok: false, error: "Server error while saving files" });
   }
 });
 
 // --------------------------
 // /api/admin/photos endpoint (list all photos)
 // --------------------------
-app.get("/api/admin/photos", checkAdmin, async (req, res) => {
+app.get("/api/admin/photos", authLimiter, checkAdmin, async (req, res) => {
   try {
-    let eventId = req.query.eventId?.trim();
-    if (!eventId) {
+    let eventId = safeString(req.query.eventId);
+    if (!eventId || !/^[A-Za-z0-9_-]{1,64}$/.test(eventId)) {
       const activeEvent = await Event.findOne({ is_active: true });
       if (!activeEvent) return res.status(404).json({ ok: false, error: "No active event" });
       eventId = activeEvent.event_id;
@@ -380,7 +544,7 @@ app.get("/api/admin/photos", checkAdmin, async (req, res) => {
     res.json({ ok: true, photos, total: photos.length });
   } catch (err) {
     req.log.error("Failed to list admin photos", { err });
-    res.status(500).json({ ok: false, error: err.message });
+    res.status(500).json({ ok: false, error: "Internal server error" });
   }
 });
 
@@ -395,7 +559,7 @@ app.get("/api/session/:sessionId/status", async (req, res) => {
   }
   try {
     // Build ordered list of event IDs to check: hinted one first, then all others
-    const hintedId = req.query.eventId?.trim();
+    const hintedId = safeString(req.query.eventId);
     const allEvents = await Event.find().select("event_id").lean();
     const allIds = allEvents.map(e => e.event_id);
 
@@ -424,7 +588,7 @@ app.get("/api/session/:sessionId/status", async (req, res) => {
     res.json({ ready: false });
   } catch (err) {
     req.log.error("Failed to check session status", { sessionId, err });
-    res.status(500).json({ ok: false, error: err.message });
+    res.status(500).json({ ok: false, error: "Internal server error" });
   }
 });
 
@@ -436,9 +600,13 @@ app.get("/p/:sessionId", (req, res) => {
   if (!/^[A-Za-z0-9_-]{1,64}$/.test(sessionId)) {
     return res.status(400).send("Invalid session ID");
   }
-  const rawEventId = req.query.eventId?.trim() ?? "";
+  const rawEventId = safeString(req.query.eventId) ?? "";
   const eventId = /^[A-Za-z0-9_.-]{1,64}$/.test(rawEventId) ? rawEventId : "";
+  // JSON.stringify produces valid JS literals; escape </script sequences to be safe
+  const safeSession = JSON.stringify(sessionId).replace(/<\//g, "<\\/");
+  const safeEvent = JSON.stringify(eventId).replace(/<\//g, "<\\/");
   res.setHeader("Content-Type", "text/html; charset=utf-8");
+  res.setHeader("Content-Security-Policy", "default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; connect-src 'self'; img-src *");
   res.send(`<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -463,8 +631,8 @@ app.get("/p/:sessionId", (req, res) => {
 </div>
 <script>
 (function(){
-  var sessionId = ${JSON.stringify(sessionId)};
-  var eventId = ${JSON.stringify(eventId)};
+  var sessionId = ${safeSession};
+  var eventId = ${safeEvent};
   function check(){
     var url = '/api/session/'+sessionId+'/status'+(eventId ? '?eventId='+encodeURIComponent(eventId) : '');
     fetch(url)
@@ -476,14 +644,21 @@ app.get("/p/:sessionId", (req, res) => {
           img.alt='Your photo';
           img.src=d.url;
           img.onerror=function(){
-            app.innerHTML='<p>Photo ready but failed to load. <a href="'+d.url+'">Try opening directly</a>.</p>';
+            app.textContent='';
+            var p=document.createElement('p');
+            p.textContent='Photo ready but failed to load. ';
+            var a=document.createElement('a');
+            a.href=d.url;
+            a.textContent='Try opening directly';
+            p.appendChild(a);
+            app.appendChild(p);
           };
           var btn=document.createElement('a');
           btn.className='btn';
           btn.href=d.url;
           btn.download='photo.jpg';
           btn.textContent='Download';
-          app.innerHTML='';
+          app.textContent='';
           app.appendChild(img);
           app.appendChild(document.createElement('br'));
           app.appendChild(btn);
@@ -505,8 +680,8 @@ app.get("/p/:sessionId", (req, res) => {
 // --------------------------
 app.get("/api/public/photos", async (req, res) => {
   try {
-    let eventId = req.query.eventId?.trim();
-    if (!eventId) {
+    let eventId = safeString(req.query.eventId);
+    if (!eventId || !/^[A-Za-z0-9_-]{1,64}$/.test(eventId)) {
       const activeEvent = await Event.findOne({ is_active: true });
       if (!activeEvent) return res.status(404).json({ ok: false, error: "No active event" });
       eventId = activeEvent.event_id;
@@ -531,17 +706,17 @@ app.get("/api/public/photos", async (req, res) => {
     res.json({ ok: true, eventId, total: photos.length, photos });
   } catch (err) {
     req.log.error("Failed to list public photos", { err });
-    res.status(500).json({ ok: false, error: err.message });
+    res.status(500).json({ ok: false, error: "Internal server error" });
   }
 });
 
 // --------------------------
 // /api/admin/download-zip endpoint (download all photos as zip)
 // --------------------------
-app.get("/api/admin/download-zip", checkAdmin, async (req, res) => {
+app.get("/api/admin/download-zip", authLimiter, checkAdmin, async (req, res) => {
   try {
-    let eventId = req.query.eventId?.trim();
-    if (!eventId) {
+    let eventId = safeString(req.query.eventId);
+    if (!eventId || !/^[A-Za-z0-9_-]{1,64}$/.test(eventId)) {
       const activeEvent = await Event.findOne({ is_active: true });
       if (!activeEvent) return res.status(404).json({ ok: false, error: "No active event" });
       eventId = activeEvent.event_id;
@@ -553,10 +728,15 @@ app.get("/api/admin/download-zip", checkAdmin, async (req, res) => {
     const fileCount = (response.Contents || []).length;
     req.log.info("Starting zip download", { eventId, fileCount });
 
-    const archive = archiver("zip", { zlib: { level: 9 } });
+    const archive = archiver("zip", { zlib: { level: 0 } });
 
     res.attachment("photos.zip");
     archive.pipe(res);
+    archive.on("error", err => {
+      req.log.error("Archiver error", { err });
+      if (!res.headersSent) res.status(500).json({ ok: false, error: "Archive error" });
+      else res.destroy(err);
+    });
 
     for (const obj of response.Contents || []) {
       const filename = obj.Key.split("/").pop();
@@ -570,14 +750,15 @@ app.get("/api/admin/download-zip", checkAdmin, async (req, res) => {
     req.log.info("Zip download complete", { eventId, fileCount });
   } catch (err) {
     req.log.error("Failed to create zip", { err });
-    res.status(500).json({ ok: false, error: err.message });
+    if (!res.headersSent) res.status(500).json({ ok: false, error: "Internal server error" });
+    else res.destroy(err);
   }
 });
 
 // --------------------------
 // /api/admin/download-selected endpoint (download selected photos)
 // --------------------------
-app.post("/api/admin/download-selected", checkAdmin, async (req, res) => {
+app.post("/api/admin/download-selected", authLimiter, checkAdmin, async (req, res) => {
   try {
     const { photoIds } = req.body;
 
@@ -585,14 +766,24 @@ app.post("/api/admin/download-selected", checkAdmin, async (req, res) => {
       return res.status(400).json({ ok: false, error: "Invalid photoIds array" });
     }
 
-    req.log.info("Starting selected zip download", { count: photoIds.length });
-    const archive = archiver("zip", { zlib: { level: 9 } });
+    // Validate every key
+    const safeIds = photoIds.filter(k => typeof k === "string" && isAllowedS3Key(k));
+    if (safeIds.length === 0) {
+      return res.status(400).json({ ok: false, error: "No valid photo keys provided" });
+    }
+
+    req.log.info("Starting selected zip download", { count: safeIds.length });
+    const archive = archiver("zip", { zlib: { level: 0 } });
 
     res.attachment("selected-photos.zip");
     archive.pipe(res);
+    archive.on("error", err => {
+      if (!res.headersSent) res.status(500).json({ ok: false, error: "Archive error" });
+      else res.destroy(err);
+    });
 
     let skipped = 0;
-    for (const key of photoIds) {
+    for (const key of safeIds) {
       try {
         const filename = key.split("/").pop();
         const s3Response = await s3.send(
@@ -606,10 +797,11 @@ app.post("/api/admin/download-selected", checkAdmin, async (req, res) => {
     }
 
     await archive.finalize();
-    req.log.info("Selected zip complete", { requested: photoIds.length, skipped });
+    req.log.info("Selected zip complete", { requested: safeIds.length, skipped });
   } catch (err) {
     req.log.error("Failed to create selected zip", { err });
-    res.status(500).json({ ok: false, error: err.message });
+    if (!res.headersSent) res.status(500).json({ ok: false, error: "Internal server error" });
+    else res.destroy(err);
   }
 });
 
@@ -671,7 +863,7 @@ app.get("/api/superadmin/tree", checkSuperadmin, async (req, res) => {
     res.json({ ok: true, tree: buildTree(allObjects) });
   } catch (err) {
     req.log.error("Failed to build tree", { err });
-    res.status(500).json({ ok: false, error: err.message });
+    res.status(500).json({ ok: false, error: "Internal server error" });
   }
 });
 
@@ -680,7 +872,7 @@ app.get("/api/superadmin/tree", checkSuperadmin, async (req, res) => {
 // --------------------------
 app.get("/api/superadmin/photos", checkSuperadmin, async (req, res) => {
   try {
-    const prefix = req.query.prefix || "";
+    const prefix = safeString(req.query.prefix) || "";
     const allObjects = [];
     let continuationToken;
 
@@ -710,7 +902,7 @@ app.get("/api/superadmin/photos", checkSuperadmin, async (req, res) => {
     res.json({ ok: true, files });
   } catch (err) {
     req.log.error("Failed to list superadmin photos", { err });
-    res.status(500).json({ ok: false, error: err.message });
+    res.status(500).json({ ok: false, error: "Internal server error" });
   }
 });
 
@@ -719,10 +911,10 @@ app.get("/api/superadmin/photos", checkSuperadmin, async (req, res) => {
 // --------------------------
 app.delete("/api/superadmin/file", checkSuperadmin, async (req, res) => {
   try {
-    const { key } = req.body;
+    const key = safeString(req.body.key);
     if (!key) return res.status(400).json({ ok: false, error: "Missing key" });
+    if (!isAllowedS3Key(key)) return res.status(400).json({ ok: false, error: "Invalid key" });
 
-    // Check existence first
     const listResponse = await s3.send(
       new ListObjectsV2Command({ Bucket: BUCKET_NAME, Prefix: key, MaxKeys: 1 })
     );
@@ -734,7 +926,7 @@ app.delete("/api/superadmin/file", checkSuperadmin, async (req, res) => {
     res.json({ ok: true, deleted: key });
   } catch (err) {
     req.log.error("Failed to delete file", { key: req.body?.key, err });
-    res.status(500).json({ ok: false, error: err.message });
+    res.status(500).json({ ok: false, error: "Internal server error" });
   }
 });
 
@@ -743,9 +935,12 @@ app.delete("/api/superadmin/file", checkSuperadmin, async (req, res) => {
 // --------------------------
 app.delete("/api/superadmin/folder", checkSuperadmin, async (req, res) => {
   try {
-    const { prefix } = req.body;
+    const prefix = safeString(req.body.prefix);
     if (!prefix || prefix === "/") {
       return res.status(400).json({ ok: false, error: "Invalid or empty prefix" });
+    }
+    if (!isAllowedS3Key(prefix)) {
+      return res.status(400).json({ ok: false, error: "Invalid prefix" });
     }
 
     const allKeys = [];
@@ -779,7 +974,7 @@ app.delete("/api/superadmin/folder", checkSuperadmin, async (req, res) => {
     res.json({ ok: true, deletedCount: allKeys.length });
   } catch (err) {
     req.log.error("Failed to delete folder", { prefix: req.body?.prefix, err });
-    res.status(500).json({ ok: false, error: err.message });
+    res.status(500).json({ ok: false, error: "Internal server error" });
   }
 });
 
@@ -788,7 +983,7 @@ app.delete("/api/superadmin/folder", checkSuperadmin, async (req, res) => {
 // --------------------------
 app.get("/api/superadmin/download-zip", checkSuperadmin, async (req, res) => {
   try {
-    const prefix = req.query.prefix || "";
+    const prefix = safeString(req.query.prefix) || "";
     const allObjects = [];
     let continuationToken;
 
@@ -805,9 +1000,13 @@ app.get("/api/superadmin/download-zip", checkSuperadmin, async (req, res) => {
     } while (continuationToken);
 
     req.log.info("Starting superadmin zip download", { prefix: prefix || "(all)", fileCount: allObjects.length });
-    const archive = archiver("zip", { zlib: { level: 9 } });
+    const archive = archiver("zip", { zlib: { level: 0 } });
     res.attachment("download.zip");
     archive.pipe(res);
+    archive.on("error", err => {
+      if (!res.headersSent) res.status(500).json({ ok: false, error: "Archive error" });
+      else res.destroy(err);
+    });
 
     for (const obj of allObjects) {
       const s3Response = await s3.send(
@@ -820,7 +1019,8 @@ app.get("/api/superadmin/download-zip", checkSuperadmin, async (req, res) => {
     req.log.info("Superadmin zip complete", { prefix: prefix || "(all)", fileCount: allObjects.length });
   } catch (err) {
     req.log.error("Failed to create superadmin zip", { err });
-    res.status(500).json({ ok: false, error: err.message });
+    if (!res.headersSent) res.status(500).json({ ok: false, error: "Internal server error" });
+    else res.destroy(err);
   }
 });
 
@@ -834,13 +1034,22 @@ app.post("/api/superadmin/download-selected", checkSuperadmin, async (req, res) 
       return res.status(400).json({ ok: false, error: "Invalid keys array" });
     }
 
-    req.log.info("Starting superadmin selected zip", { count: keys.length });
-    const archive = archiver("zip", { zlib: { level: 9 } });
+    const safeKeys = keys.filter(k => typeof k === "string" && isAllowedS3Key(k));
+    if (safeKeys.length === 0) {
+      return res.status(400).json({ ok: false, error: "No valid keys provided" });
+    }
+
+    req.log.info("Starting superadmin selected zip", { count: safeKeys.length });
+    const archive = archiver("zip", { zlib: { level: 0 } });
     res.attachment("selected.zip");
     archive.pipe(res);
+    archive.on("error", err => {
+      if (!res.headersSent) res.status(500).json({ ok: false, error: "Archive error" });
+      else res.destroy(err);
+    });
 
     let skipped = 0;
-    for (const key of keys) {
+    for (const key of safeKeys) {
       try {
         const s3Response = await s3.send(
           new GetObjectCommand({ Bucket: BUCKET_NAME, Key: key })
@@ -853,10 +1062,11 @@ app.post("/api/superadmin/download-selected", checkSuperadmin, async (req, res) 
     }
 
     await archive.finalize();
-    req.log.info("Superadmin selected zip complete", { requested: keys.length, skipped });
+    req.log.info("Superadmin selected zip complete", { requested: safeKeys.length, skipped });
   } catch (err) {
     req.log.error("Failed to create superadmin selected zip", { err });
-    res.status(500).json({ ok: false, error: err.message });
+    if (!res.headersSent) res.status(500).json({ ok: false, error: "Internal server error" });
+    else res.destroy(err);
   }
 });
 
@@ -865,12 +1075,16 @@ app.post("/api/superadmin/download-selected", checkSuperadmin, async (req, res) 
 // --------------------------
 app.post("/api/superadmin/move", checkSuperadmin, async (req, res) => {
   try {
-    const { sourceKey, destKey } = req.body;
+    const sourceKey = safeString(req.body.sourceKey);
+    const destKey = safeString(req.body.destKey);
     if (!sourceKey || !destKey) {
       return res.status(400).json({ ok: false, error: "Missing sourceKey or destKey" });
     }
     if (sourceKey === destKey) {
       return res.status(400).json({ ok: false, error: "Source and destination are the same" });
+    }
+    if (!isAllowedS3Key(sourceKey) || !isAllowedS3Key(destKey)) {
+      return res.status(400).json({ ok: false, error: "Invalid key path" });
     }
 
     req.log.info("Moving file", { from: sourceKey, to: destKey });
@@ -888,7 +1102,7 @@ app.post("/api/superadmin/move", checkSuperadmin, async (req, res) => {
     res.json({ ok: true, moved: { from: sourceKey, to: destKey } });
   } catch (err) {
     req.log.error("Failed to move file", { from: req.body?.sourceKey, to: req.body?.destKey, err });
-    res.status(500).json({ ok: false, error: err.message });
+    res.status(500).json({ ok: false, error: "Internal server error" });
   }
 });
 
@@ -908,7 +1122,7 @@ app.post("/api/superadmin/upload-wallpaper", checkSuperadmin, upload.single("wal
     res.json({ ok: true, key, url });
   } catch (err) {
     req.log.error("Failed to upload wallpaper", { err });
-    res.status(500).json({ ok: false, error: err.message });
+    res.status(500).json({ ok: false, error: "Internal server error" });
   }
 });
 
@@ -916,8 +1130,8 @@ app.post("/api/superadmin/upload-wallpaper", checkSuperadmin, upload.single("wal
 // Global error handler
 // --------------------------
 app.use((err, req, res, _next) => {
-  req.log.error("Unhandled error", { err });
-  res.status(500).json({ ok: false, error: err.message });
+  (req.log ?? logger).error("Unhandled error", { err });
+  res.status(500).json({ ok: false, error: "Internal server error" });
 });
 
 // --------------------------
@@ -938,7 +1152,7 @@ app.use((err, req, res, _next) => {
 
   const anyEvent = await Event.findOne();
   if (!anyEvent) {
-    await Event.create({
+    const seedEvent = new Event({
       event_id: "test",
       event_name: "test server",
       templates: [
@@ -950,10 +1164,14 @@ app.use((err, req, res, _next) => {
       qr: { size: 300, margin: 1 },
       is_active: true,
     });
+    await seedEvent.save();
     logger.info('Seeded default "test" event');
   }
 
   app.listen(PORT, () => {
     logger.info(`Server listening on http://localhost:${PORT}`);
   });
-})();
+})().catch(err => {
+  logger.error("Startup failed", { err });
+  process.exit(1);
+});

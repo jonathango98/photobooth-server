@@ -1,4 +1,5 @@
 import mongoose from "mongoose";
+import bcrypt from "bcryptjs";
 
 const slotSchema = new mongoose.Schema(
   { x: Number, y: Number },
@@ -18,7 +19,13 @@ const templateSchema = new mongoose.Schema(
 );
 
 const eventSchema = new mongoose.Schema({
-  event_id: { type: String, required: true, unique: true, index: true },
+  event_id: {
+    type: String,
+    required: true,
+    unique: true,
+    index: true,
+    match: /^[A-Za-z0-9_-]{1,64}$/,
+  },
   event_name: { type: String, required: true },
   templates: [templateSchema],
   capture: {
@@ -41,14 +48,17 @@ const eventSchema = new mongoose.Schema({
     margin: Number,
   },
   background_url: { type: String, default: "" },
-  admin_password: { type: String, default: "" },
-  is_active: { type: Boolean, default: true },
+  admin_password: { type: String, default: "", select: false },
+  is_active: { type: Boolean, default: true, index: true },
   created_at: { type: Date, default: Date.now },
   updated_at: { type: Date, default: Date.now },
 });
 
 eventSchema.pre("save", async function () {
   this.updated_at = new Date();
+  if (this.isModified("admin_password") && this.admin_password) {
+    this.admin_password = await bcrypt.hash(this.admin_password, 12);
+  }
 });
 
 export default mongoose.model("Event", eventSchema);
